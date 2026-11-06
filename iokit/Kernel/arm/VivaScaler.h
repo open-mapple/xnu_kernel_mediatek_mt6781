@@ -13,6 +13,11 @@
  *   source. Formats outside the mask are refused with kIOReturnUnsupported, which every client handles by
  *   falling back (VideoToolbox propagates errors of a published service, hence the mask).
  *
+ * vivascalercpumax (pixels, default 65536): largest destination the CPU scales or converts. Bigger requests that the MDP
+ *   cannot take are refused with kIOReturnUnsupported: QuartzCore then does them on the GPU as without the service
+ *   (its switcher/snapshot reductions of the whole screen, 1125x2436 -> 787x1705, cost tens of milliseconds on the
+ *   CPU against ~2 ms on the GPU). Same-size copies of one RGB format are always done (one memcpy per row).
+ *
  * Counters: property "VivaScalerStats" of the service (ioreg / Viva Manager).
  */
 #ifndef _IOKIT_ARM_VIVASCALER_H
@@ -71,6 +76,7 @@ private:
 	IOLock   *fLock;            /* one transfer at a time (CPU work is short; the MDP has one pipe) */
 	int       fMode;
 	uint32_t  fFormats;
+	uint32_t  fCpuMax;          /* largest destination (pixels) the CPU scales / converts */
 	struct viva_mdp *fMdp;      /* NULL = CPU only */
 	uint64_t  fTransfers, fCpu, fMdpDone, fUnsupported, fErrors, fBytes, fNs, fCustomFilters, fClients;
 	uint64_t  fLastPublish;

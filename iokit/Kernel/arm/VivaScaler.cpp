@@ -108,6 +108,8 @@ AppleM2ScalerCSCDriver::start(IOService *provider)
 	}
 	fFormats = 3;
 	PE_parse_boot_argn("vivascalerformats", &fFormats, sizeof(fFormats));
+	fCpuMax = 65536;
+	PE_parse_boot_argn("vivascalercpumax", &fCpuMax, sizeof(fCpuMax));
 	fLock = IOLockAlloc();
 	if (fLock == NULL || !IOService::start(provider)) {
 		return false;
@@ -127,6 +129,7 @@ AppleM2ScalerCSCDriver::start(IOService *provider)
 	}
 	setProperty("VivaScalerBackend", fMode >= 2 ? "mdp" : "cpu");
 	setProperty("VivaScalerFormats", fFormats, 32);
+	setProperty("VivaScalerCpuMax", fCpuMax, 32);
 	setProperty("IOUserClientClass", "AppleM2ScalerCSCDriverUserClient");
 	publishStats();
 	registerService();
@@ -382,6 +385,16 @@ AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, Sw
 			*backend = "mdp";
 			fMdpDone++;
 			return ret;
+		}
+	}
+	/* the CPU only for small work or plain copies: everything else back to the client (QuartzCore uses the GPU) */
+	{
+		uint64_t dw = req->dstW ? req->dstW : dst->width, dh = req->dstH ? req->dstH : dst->height;
+		bool same = src->pixelFormat == dst->pixelFormat && !srcYuv &&
+		    (req->srcW == 0 || req->srcW == dw << 16) && (req->srcH == 0 || req->srcH == dh << 16) &&
+		    (req->srcW != 0 || (src->width == dw && src->height == dh)) && !(flags & kVivaScalerFlagAlphaOverride);
+		if (!same && dw * dh > fCpuMax) {
+			return kIOReturnUnsupported;
 		}
 	}
 	sweet_surface_before_cpu_access(src);
