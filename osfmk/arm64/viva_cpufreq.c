@@ -21,9 +21,19 @@
  * chip's efuse bin): {MHz, vsel, posdiv}. Index 0 is the fastest.
  *
  * Governor (every 16 ms, 100 ms when everything idles at the floor): busy = 1 - idle/wall per CPU from recount, the
- * busiest CPU of a cluster counts. >= 80 % busy: the ceiling; else the slowest OPP that would be <= 70 % busy;
- * lower OPPs only after 3 samples in a row. The CCI follows the faster cluster's OPP index. Ceilings: boot-args,
- * Low Power Mode (viva_cpufreq_set_lowpower, VivaBattery.cpp), thermal (viva_cpufreq_set_thermal_cap).
+ * busiest CPU of a cluster counts. >= 80 % busy: the ceiling; else the slowest OPP that would be <= 50 % busy (0183;
+ * 70 % before); lower OPPs only after 3 samples in a row. The CCI follows the faster cluster's OPP index. Ceilings:
+ * boot-args, Low Power Mode (viva_cpufreq_set_lowpower, VivaBattery.cpp), thermal (viva_cpufreq_set_thermal_cap).
+ *
+ * UI boost (0183, gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md P1): a UI thread that works 8 ms of every 33 is 25 %
+ * busy and never moved the clusters off the floor (Settings scrolled at 23 fps, 31 with the clocks at max). The
+ * display (every SwapEnd, SweetFramebuffer.cpp) and the touch screen (every report, VivaGT9896.cpp) call
+ * viva_cpufreq_ui_activity(); for vivacpuboostms (250) after the last call LL and big run at least at
+ * vivacpuboost=MHz (default: their fastest OPP), still under every ceiling (thermal 0147, Low Power Mode, link).
+ * The first signal after a quiet period samples at once instead of waiting up to 100 ms. vivacpuboostms=0 = off.
+ * With the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's clock / 1.46
+ * (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55. If the big
+ * ceiling does not allow that, the preference is suspended until it does.
  *
  * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
  *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
@@ -38,7 +48,7 @@
  *   (LL 1618, big 1670). The controller's hardware reset protection (TOPRGU thermal mode) is NOT armed.
  *   vivatherm=0 = no LVTS (cap at opp 6).
  * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
- *   cpu fast on|off | cpu reset (counters).
+ *   cpu fast on|off | cpu boost on|off | cpu reset (counters).
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <stdint.h>
@@ -118,6 +128,16 @@ static uint64_t gTimeAt[NDOM][NOPP];   /* mach ticks spent at each OPP */
 static uint64_t gLastAt;
 static const char *gWhy = "not started";
 static thread_call_t gCall;
+/* 0183 UI boost */
+static bool gBoost = true;              /* vivacpuboostms != 0, "cpu boost on|off" */
+static int gBoostIdx[NDOM];             /* vivacpuboost: LL and big at least this fast while boosted */
+static uint64_t gBoostAbs;              /* vivacpuboostms in mach time */
+static volatile uint64_t gBoostUntil;   /* written without the lock by viva_cpufreq_ui_activity */
+static volatile bool gBoosting;         /* the last sample was boosted */
+static volatile bool gSlowPoll;         /* the governor sleeps 100 ms */
+static uint64_t gBoostSignals, gBoostStarts, gBoostTime, gBoostLastTick;
+static bool gFastSuspended;             /* A76 preference off: big cannot be fast enough (see the top) */
+static uint64_t gFastSuspends;
 
 static inline uint32_t rd(uint64_t pa) { return ml_phys_read_word_64(pa); }
 static void therm_tick(void);
@@ -277,7 +297,7 @@ static void
 update_fast_map(void)
 {
 	uint64_t m = 0;
-	if (gFast && gGov && kOppBig[ceiling(DOM_BIG)].mhz >= 1530) {
+	if (gFast && gGov && !gFastSuspended && kOppBig[ceiling(DOM_BIG)].mhz >= 1530) {
 		for (int c = BIG_FIRST; c <= BIG_LAST; c++) {
 			if (processor_array[c] != PROCESSOR_NULL) {
 				m |= 1ull << c;
@@ -320,7 +340,7 @@ gov_target(int d, unsigned busy)
 	if (busy >= 800) {
 		return cap;
 	}
-	unsigned need = kOpp[d][gIdx[d]].mhz * busy / 700;
+	unsigned need = kOpp[d][gIdx[d]].mhz * busy / 500;
 	int t = idx_for_mhz(d, need);
 	if (t < cap) {
 		t = cap;
@@ -342,8 +362,19 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		therm_tick();
 		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST);
 		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST);
+		uint64_t now = mach_absolute_time();
+		bool boost = gBoost && now < gBoostUntil;
+		if (boost) {
+			gBoostStarts += !gBoosting;
+			gBoostTime += gBoosting && gBoostLastTick != 0 ? now - gBoostLastTick : 0;
+		}
+		gBoosting = boost;
+		gBoostLastTick = now;
 		for (int d = DOM_LL; d <= DOM_BIG; d++) {
 			int t = gov_target(d, gBusy[d]);
+			if (boost && t > gBoostIdx[d]) {
+				t = gBoostIdx[d];       /* UI boost: at least this fast (the ceiling below still applies) */
+			}
 			if (t > gIdx[d]) {              /* slower */
 				if (++gDown[d] < 3) {
 					t = gIdx[d];
@@ -356,6 +387,19 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			}
 			want[d] = t;
 		}
+		/* A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended */
+		if (gFast) {
+			int need = idx_for_mhz(DOM_BIG, kOppLL[want[DOM_LL]].mhz * 140 / 146);
+			bool suspend = need < ceiling(DOM_BIG);
+			if (!suspend && want[DOM_BIG] > need) {
+				want[DOM_BIG] = need;
+			}
+			if (suspend != gFastSuspended) {
+				gFastSuspended = suspend;
+				gFastSuspends += suspend;
+				update_fast_map();
+			}
+		}
 		int fastest = want[DOM_LL] < want[DOM_BIG] ? want[DOM_LL] : want[DOM_BIG];
 		want[DOM_CCI] = fastest < ceiling(DOM_CCI) ? ceiling(DOM_CCI) : fastest;
 		gBusy[DOM_CCI] = gBusy[DOM_LL] > gBusy[DOM_BIG] ? gBusy[DOM_LL] : gBusy[DOM_BIG];
@@ -364,8 +408,9 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			update_fast_map();
 			printf("VIVA CPUFREQ: %s, governor stopped\n", gWhy);
 		}
-		slow = gIdx[DOM_LL] == FLOOR_IDX && gIdx[DOM_BIG] == FLOOR_IDX && gBusy[DOM_CCI] < 100;
+		slow = !boost && gIdx[DOM_LL] == FLOOR_IDX && gIdx[DOM_BIG] == FLOOR_IDX && gBusy[DOM_CCI] < 100;
 	}
+	gSlowPoll = slow;
 	bool again = gGov && gReady;
 	lck_mtx_unlock(&viva_cpufreq_lock);
 	if (again) {
@@ -590,6 +635,36 @@ therm_tick(void)
 	}
 }
 
+/*
+ * 0183: the display presented a frame or the touch screen reported a contact (any thread, never blocks; not from
+ * interrupt context). Boosts LL and big for vivacpuboostms from now (see the top).
+ */
+void
+viva_cpufreq_ui_activity(void)
+{
+	if (!gBoost || !gGov) {
+		return;
+	}
+	gBoostUntil = mach_absolute_time() + gBoostAbs;
+	gBoostSignals++;
+	if (!gBoosting && gSlowPoll && gCall != NULL) {
+		gSlowPoll = false;
+		thread_call_enter(gCall);       /* idle polling (100 ms): sample now */
+	}
+}
+
+/* 0183: Viva Manager / "gpu kv": boost on, rising edges, time boosted (ms), activity signals. */
+void
+viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(gBoostTime, &ns);
+	*on = gBoost && gGov;
+	*starts = gBoostStarts;
+	*ms = ns / NSEC_PER_MSEC;
+	*signals = gBoostSignals;
+}
+
 /* Called from VivaPwrap::start (the PMIC is reachable from then on). */
 void
 viva_cpufreq_start(void)
@@ -613,6 +688,20 @@ viva_cpufreq_start(void)
 		gLpmIdx[d] = idx_for_mhz(d, lpm[d]);
 		while (gLpmIdx[d] < NOPP - 1 && kOpp[d][gLpmIdx[d]].mhz > lpm[d]) {
 			gLpmIdx[d]++;
+		}
+	}
+	unsigned boostMhz = 0, boostMs = 250;
+	(void)PE_parse_boot_argn("vivacpuboost", &boostMhz, sizeof(boostMhz));
+	(void)PE_parse_boot_argn("vivacpuboostms", &boostMs, sizeof(boostMs));
+	gBoost = boostMs != 0;
+	nanoseconds_to_absolutetime((uint64_t)(boostMs > 5000 ? 5000 : boostMs) * NSEC_PER_MSEC, &gBoostAbs);
+	for (int d = DOM_LL; d <= DOM_BIG; d++) {
+		gBoostIdx[d] = 0;
+		if (boostMhz != 0) {            /* the fastest OPP not above boostMhz */
+			gBoostIdx[d] = idx_for_mhz(d, boostMhz);
+			while (gBoostIdx[d] < FLOOR_IDX && kOpp[d][gBoostIdx[d]].mhz > boostMhz) {
+				gBoostIdx[d]++;
+			}
 		}
 	}
 	if (PE_parse_boot_argn("vivalpmcpu", &v, sizeof(v))) {
@@ -724,7 +813,22 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 		gFast = strncmp(b, "off", 3) != 0;
 		update_fast_map();
 		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFast ? "on" : "off", sched_viva_fast_cpus);
+	} else if (strncmp(a, "boost", 5) == 0) {
+		const char *b = skip(word_end(a));
+		if (strncmp(b, "on", 2) == 0) {
+			gBoost = true;
+			if (gBoostAbs == 0) {
+				nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &gBoostAbs);
+			}
+		} else if (strncmp(b, "off", 3) == 0) {
+			gBoost = false;
+		}
+		uint64_t ns = 0;
+		absolutetime_to_nanoseconds(gBoostAbs, &ns);
+		SAY("UI boost %s (%llu ms, ll >= %u MHz, big >= %u MHz)\n", gBoost ? "on" : "off", ns / NSEC_PER_MSEC,
+		    kOppLL[gBoostIdx[DOM_LL]].mhz, kOppBig[gBoostIdx[DOM_BIG]].mhz);
 	} else if (strncmp(a, "reset", 5) == 0) {
+		gBoostSignals = gBoostStarts = gBoostTime = gFastSuspends = 0;
 		gSteps = gVoltWrites = gErrors = gSamples = 0;
 		memset(gTimeAt, 0, sizeof(gTimeAt));
 		gLastAt = 0;
@@ -781,6 +885,15 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 			    pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz, kOpp[d][ceiling(d)].mhz,
 			    gBusy[d] / 10, gBusy[d] % 10);
 		}
+		{
+			uint64_t bns = 0, bms = 0;
+			absolutetime_to_nanoseconds(gBoostTime, &bns);
+			absolutetime_to_nanoseconds(gBoostAbs, &bms);
+			SAY("  UI boost %s%s (%llu ms, ll >= %u big >= %u MHz): %llu boosts, %llu ms boosted, %llu signals; "
+			    "A76 preference suspended %s (%llu times)\n", gBoost ? "on" : "off", gBoosting ? ", active" : "",
+			    bms / NSEC_PER_MSEC, kOppLL[gBoostIdx[DOM_LL]].mhz, kOppBig[gBoostIdx[DOM_BIG]].mhz, gBoostStarts,
+			    bns / NSEC_PER_MSEC, gBoostSignals, gFastSuspended ? "now" : "no", gFastSuspends);
+		}
 		SAY("  Vproc11 (big) %u mV, Vproc12 (ll+cci) %u mV; %llu steps, %llu rail writes, %llu errors, %llu samples\n",
 		    500 + v11 * 625 / 100, 500 + v12 * 625 / 100, gSteps, gVoltWrites, gErrors, gSamples);
 		for (int d = 0; d < NDOM; d++) {
@@ -796,7 +909,7 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 			}
 			SAY("\n");
 		}
-		SAY("usage: cpu [status] | gov on|off | set ll|big|cci MHz | max ll|big|cci MHz | fast on|off | reset\n");
+		SAY("usage: cpu [status] | gov on|off | set ll|big|cci MHz | max ll|big|cci MHz | fast on|off | boost on|off | reset\n");
 	}
 	lck_mtx_unlock(&viva_cpufreq_lock);
 }
