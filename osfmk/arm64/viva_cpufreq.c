@@ -31,9 +31,9 @@
  * viva_cpufreq_ui_activity(); for vivacpuboostms (250) after the last call LL and big run at least at
  * vivacpuboost=MHz (default: their fastest OPP), still under every ceiling (thermal 0147, Low Power Mode, link).
  * The first signal after a quiet period samples at once instead of waiting up to 100 ms. vivacpuboostms=0 = off.
- * With the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's clock / 1.46
- * (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55. If the big
- * ceiling does not allow that, the preference is suspended until it does.
+ * While boosted with the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's
+ * clock / 1.46 (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55.
+ * If the big ceiling does not allow that, the preference is suspended until it does.
  *
  * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
  *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
@@ -387,8 +387,11 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			}
 			want[d] = t;
 		}
-		/* A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended */
-		if (gFast) {
+		/*
+		 * A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended. Only while boosted
+		 * (0187): outside a boost it kept big at ~1920 MHz whenever LL ran fast, idle A76s included (84 C on the phone).
+		 */
+		if (gFast && boost) {
 			int need = idx_for_mhz(DOM_BIG, kOppLL[want[DOM_LL]].mhz * 140 / 146);
 			bool suspend = need < ceiling(DOM_BIG);
 			if (!suspend && want[DOM_BIG] > need) {
