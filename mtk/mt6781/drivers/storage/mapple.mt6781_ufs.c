@@ -1,15 +1,13 @@
 /*
  * The realme 8i's UFS (MT6781, ufshci@11270000, UFSHCI 3.1), read only: the partition xnusys of the user unit
  * (LUN 2) as /dev/mtkufs0 and /dev/rmtkufs0, and with mtkufs_root=1 the root (iokit/bsddev/IOKitBSDInit.cpp asks
- * hakios_mtk_ufs_root for it). Boot-arg mtkufs=1, and mtkloader's mtkufs_lba=, mtkufs_blocks=, mtkufs_lkutrl=
+ * mapple_mtk_ufs_root for it). Boot-arg mtkufs=1, and mtkloader's mtkufs_lba=, mtkufs_blocks=, mtkufs_lkutrl=
  * (XNU_UFS=1: it found xnusys in the GPT through LK's list); without all four nothing here touches the controller.
  *
- * Adapted from drivers/storage/hakios.ufshc.c (the POCO's): its transfer list switch, whitelist, slot layout and
- * the check of what a slot holds, cut down to one request at a time, polled. What differs: the list and command
- * descriptors are this kernel's own memory (one contiguous piece; its cached view written out once and never used
- * again, mapped a second time without caching, as hakios.lx.c does); there is no loader to share the controller with
- * during a run (LK is gone): LK's list address comes from mtkloader, is checked against the controller's at the switch
- * and is put back at the end (hakios_mt6781_ufs_quiesce, from loader_return).
+ * One request at a time, polled, on this kernel's own transfer list switched in for LK's. The list and command
+ * descriptors are one contiguous piece of this kernel's memory, its cached view written out once and never used
+ * again, mapped a second time without caching. LK's list address comes from mtkloader, is checked against the
+ * controller's at the switch and is put back at the end (mapple_mt6781_ufs_quiesce, from loader_return).
  *
  * LK leaves the controller up: link up, its list running at its own memory, nothing in flight. Nothing of that is
  * changed here: no reset, link startup, UIC command, clock, power, interrupt enable or AHIT write; the task
@@ -20,31 +18,31 @@
  * Read only by construction: one check (mufs_refusal) before anything goes into a slot -- READ(10), READ CAPACITY(10),
  * TEST UNIT READY, nothing else; LUN 2 only; data from the device or none, never the W flag; a READ(10)'s blocks
  * inside xnusys's extent, or, only while the start checks that extent against the GPT itself (mufs_gpt_check), inside
- * the primary GPT (blocks 1..5); a disagreement with mtkloader and nothing more is read. What the slot then holds is read back and must pass again before the doorbell. Slot 0 holds
- * the proof (a TEST UNIT READY that must come back in this list after the switch), slot 1 the reads, the others a
+ * the primary GPT (blocks 1..5); a disagreement with mtkloader and nothing more is read. What the slot then holds
+ * is read back and must pass again before the doorbell. Slot 0 holds the proof (a TEST UNIT READY that must come back in this list after the switch), slot 1 the reads, the others a
  * TEST UNIT READY that is never rung. Data goes through one contiguous bounce buffer, cleaned and invalidated around
  * every read. The doorbell is rung and waited for with interrupts off.
  *
  * Writing (boot-arg mtkufs_write=1, and mtkloader's mtkufs_dlba= mtkufs_dblocks=, checked against the GPT here like
- * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (the boot settings block's), SYNCHRONIZE CACHE(10)
- * of all of it; nothing else ever written. mtkufs_wtest=1 is the dry run: one MiB of a known pattern at darwin + 1 MiB,
- * written, the cache synchronized, read back and compared, with the speed of each.
+ * xnusys's): WRITE(10) and READ(10) only inside the partition darwin past its first MiB (the boot settings block's),
+ * SYNCHRONIZE CACHE(10) of all of it; nothing else ever written. mtkufs_wtest=1 is the dry run: one MiB of a known
+ * pattern at darwin + 1 MiB, written, the cache synchronized, read back and compared, with the speed of each.
  *
- * The data volume's store (userland/src/var_store.c, the POCO's protocol): /dev/rufs_darwin, darwin past its first
- * MiB counted in bytes from darwin's start; kern.hakios.var_store_at says where the store starts (1 MiB);
- * kern.hakios.var_busy is the claim a writer must hold; kern.hakios.var_save the handshake with the saver, asked at
- * the end of a run (hakios_var_save_on_return). Every write is read back and compared before it is answered; the
+ * The data volume's store (userland/src/var_store.c): /dev/rufs_darwin, darwin past its first
+ * MiB counted in bytes from darwin's start; kern.mapple.var_store_at says where the store starts (1 MiB);
+ * kern.mapple.var_busy is the claim a writer must hold; kern.mapple.var_save the handshake with the saver, asked at
+ * the end of a run (mapple_var_save_on_return). Every write is read back and compared before it is answered; the
  * cache is synchronized when the device is closed and before LK's list goes back.
  *
  * var_store_crash_at=N, a test only: right after the N-th write to /dev/rufs_darwin of this boot, before its read-back
  * and with nothing synchronized, the phone is reset at once (PSCI SYSTEM_RESET): a save cut off as by a power loss.
  *
  * The data volume (boot-arg mtkufs_data=1 read only, 2 writable; with mtkufs_write=1): /dev/mtkufs_data, a block
- * device over darwin past the store's two slots and the breadcrumbs' MiB (DATA_FIRST) to its end, which init mounts on /private/var as HFS Plus
- * (var_hfs=mtkufs_data). Every I/O is checked against that window here, so it never reaches the store or the boot
+ * device over darwin past the store's two slots and the breadcrumbs' MiB (DATA_FIRST) to its end, which init mounts
+ * on /private/var as HFS Plus (var_hfs=mtkufs_data). Every I/O is checked against that window here, so it never reaches the store or the boot
  * settings block; the whitelist still stands under it. Its writes are not read back (mtkufs_readback=1: they are);
  * DKIOCSYNCHRONIZE synchronizes the device's cache (HFS Plus's journal asks it); the end of a run syncs the file
- * systems first (hakios_var_save_on_return). mtkufs_data_crash_at=N, a test only: the phone reset right after the
+ * systems first (mapple_var_save_on_return). mtkufs_data_crash_at=N, a test only: the phone reset right after the
  * N-th write to it, as var_store_crash_at.
  */
 #include <kern/clock.h>
@@ -60,7 +58,7 @@
 #include <sys/disk.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/msgbuf.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
@@ -78,8 +76,8 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 extern void loader_log_putc(char c);
 extern void IOSleep(unsigned int milliseconds);
-void hakios_mt6781_ufs_quiesce(void);
-void hakios_var_save_on_return(void);
+void mapple_mt6781_ufs_quiesce(void);
+void mapple_var_save_on_return(void);
 extern int sync_internal(void);                 /* bsd/vfs/vfs_syscalls.c: the file systems synced, within 5 s */
 static int data_sync(void);
 extern void bsd_log_lock_safe(void);           /* bsd/kern/subr_log.c */
@@ -136,7 +134,7 @@ extern void bsd_log_unlock(void);
 #define AREA_SIZE           (AREA_UCD + SLOTS * UCD_SIZE)
 #define BOUNCE              (256u << 10)        /* the most one PRD table entry describes */
 #define BLOCK               4096u
-#define SECTOR              512u                /* what the block device says its block is (as the Hot 20's) */
+#define SECTOR              512u                /* what the block device says its block is */
 #define TIMEOUT_US          1000000
 #define GPT_HEADER          1                   /* the primary GPT, as gpt-carve.py lays it for 4096-byte blocks */
 #define GPT_ENTRIES         2
@@ -178,7 +176,7 @@ static bool started, usable, in, dead;
 static bool gpt_window;                         /* the primary GPT readable: only inside mufs_gpt_check */
 static int bmajor = -1, cmajor = -1;
 static uint64_t mufs_reads, mufs_errors, mufs_refused;
-static LCK_GRP_DECLARE(mufs_lck_grp, "hakios-mt6781-ufs");
+static LCK_GRP_DECLARE(mufs_lck_grp, "mapple-mt6781-ufs");
 static LCK_MTX_DECLARE(mufs_lock, &mufs_lck_grp);
 
 /* at the end (loader_return), into the loader's log directly: printf is not for that moment */
@@ -227,7 +225,7 @@ be32(const uint8_t *p)
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
-/* ---- the whitelist: the one check every command passes before it goes into a slot ---- */
+/* the whitelist: the one check every command passes before it goes into a slot */
 
 static const char *
 mufs_refusal(const uint8_t *upiu, uint32_t dw0)
@@ -537,8 +535,6 @@ mufs_selftest_darwin(void)
 	return right;
 }
 
-/* ---- one command in one slot ---- */
-
 static volatile uint32_t *
 slot_ucd(uint32_t slot)
 {
@@ -645,8 +641,6 @@ mufs_ring(uint32_t slot, const char *what)
 	return 0;
 }
 
-/* ---- the switches ---- */
-
 /* LK's list back: what is in flight waited for (1 s), cleared if it does not finish, stopped, LK's address, started. */
 static bool
 mufs_put_back(uint32_t *db_left, uint32_t *cnr_ours)
@@ -745,8 +739,6 @@ mufs_switch_in(void)
 	    ((volatile const uint8_t *)slot_ucd(SLOT_PROOF))[UCD_RESPONSE + 7]);
 	return 0;
 }
-
-/* ---- reading ---- */
 
 /* blocks [lba, lba + blocks) of LUN 2 into the bounce buffer (mufs_lock held) */
 static int
@@ -1049,7 +1041,7 @@ ahit_says(uint32_t ahit, char *s, size_t n)
 	return s;
 }
 
-/* ---- the start: once, from the root's hook or from hakios_input_init, whichever comes first ---- */
+/* the start: once, from the root's hook or from mapple_input_init, whichever comes first */
 
 static int
 mufs_start(void)
@@ -1166,7 +1158,7 @@ mufs_start(void)
 		mufs_write_test();
 	}
 
-	/* the device as long as xnusys's APFS containers, back to back, as the Hot 20's eMMC driver has it (md0's size) */
+	/* the device as long as xnusys's APFS containers, back to back */
 	dev_blocks = part_blocks;
 	for (uint64_t at = 0; at < part_blocks * BLOCK;) {
 		static uint32_t sb[BLOCK / 4];
@@ -1208,7 +1200,7 @@ mufs_start(void)
 	return 0;
 }
 
-/* ---- the data volume's store: the POCO's handshake and claim (drivers/storage/hakios.ufs.c), for var_store.c ---- */
+/* the data volume's store: the handshake and claim var_store.c uses */
 
 #define VAR_SAVE_NONE      0
 #define VAR_SAVE_IDLE      1
@@ -1220,8 +1212,8 @@ static volatile int var_save = VAR_SAVE_NONE;
 static int var_busy_pid;
 static uint64_t var_store_at = DARWIN_KEEP * (uint64_t)BLOCK;
 
-SYSCTL_DECL(_kern_hakios);
-SYSCTL_QUAD(_kern_hakios, OID_AUTO, var_store_at, CTLFLAG_RD | CTLFLAG_LOCKED, &var_store_at,
+SYSCTL_DECL(_kern_mapple);
+SYSCTL_QUAD(_kern_mapple, OID_AUTO, var_store_at, CTLFLAG_RD | CTLFLAG_LOCKED, &var_store_at,
     "where in darwin the data volume's store starts, in bytes (past the boot settings block)");
 
 /* 1 registers the saver, 3 says the volume is in the flash; 2 is the kernel's */
@@ -1244,7 +1236,7 @@ sysctl_var_save(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused 
 	}
 	return 0;
 }
-SYSCTL_PROC(_kern_hakios, OID_AUTO, var_save, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_save, "I",
+SYSCTL_PROC(_kern_mapple, OID_AUTO, var_save, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_save, "I",
     "the data volume's saver: 1 registers, 2 is the kernel asking, 3 is done");
 
 /* 1 takes the claim (from a holder that is gone, too), 0 gives it back; reading says who holds it */
@@ -1283,7 +1275,7 @@ sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused 
 	lck_mtx_unlock(&mufs_lock);
 	return error;
 }
-SYSCTL_PROC(_kern_hakios, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_busy, "I",
+SYSCTL_PROC(_kern_mapple, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_var_busy, "I",
     "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
 
 /*
@@ -1301,7 +1293,7 @@ darwin_rw(struct uio *uio, bool writing)
 	}
 	if (writing && (var_busy_pid == 0 || var_busy_pid != proc_selfpid())) {
 		mufs_refused++;
-		printf("mtkufs: a write to /dev/rufs_darwin by process %d without the claim (kern.hakios.var_busy): refused\n",
+		printf("mtkufs: a write to /dev/rufs_darwin by process %d without the claim (kern.mapple.var_busy): refused\n",
 		    proc_selfpid());
 		return EPERM;
 	}
@@ -1392,11 +1384,10 @@ write_var_file(const char *path, const char *data, uint32_t len)
 }
 
 /*
- * var_store_log=1: the kernel's message buffer, oldest first, into /private/var/root/hakios-run.log, and the console as
- * loader_return keeps it (its first 256 KB and last 2.5 MB: the processes' lines, tools/latency.py's "tl:") into
- * /private/var/root/hakios-console.log, so that the store
- * saved next keeps it -- the log of a run that ends in a reset, which no memory survives (read back from Android with
- * tools/var-store-read.py extract root/hakios-run.log; not under log/, whose contents the store leaves out).
+ * var_store_log=1: the kernel's message buffer, oldest first, into /private/var/root/mapple-run.log, and the console as
+ * loader_return keeps it (its first 256 KB and last 2.5 MB) into /private/var/root/mapple-console.log, so that the
+ * store saved next keeps the log of a run that ends in a reset, which no memory survives. Not under log/, whose
+ * contents the store leaves out.
  */
 static void
 log_into_var(void)
@@ -1421,11 +1412,11 @@ log_into_var(void)
 	while (from < size && copy[from] == 0) {
 		from++;                                 /* a buffer not yet gone round: its unused start */
 	}
-	(void)write_var_file("/private/var/root/hakios-run.log", copy + from, size - from);
+	(void)write_var_file("/private/var/root/mapple-run.log", copy + from, size - from);
 	kfree_data(copy, size);
 	copy = kalloc_data(CONSOLE_MAX, Z_WAITOK);
 	if (copy != NULL) {
-		(void)write_var_file("/private/var/root/hakios-console.log", copy, loader_log_copy(copy, CONSOLE_MAX));
+		(void)write_var_file("/private/var/root/mapple-console.log", copy, loader_log_copy(copy, CONSOLE_MAX));
 		kfree_data(copy, CONSOLE_MAX);
 	}
 }
@@ -1436,7 +1427,7 @@ log_into_var(void)
  * still whole. No saver registered: no wait.
  */
 void
-hakios_var_save_on_return(void)
+mapple_var_save_on_return(void)
 {
 	uint32_t ms = VAR_SAVE_MS;
 	uint64_t waited = 0;
@@ -1475,7 +1466,7 @@ hakios_var_save_on_return(void)
  * only; each boot starts again at the first block.
  */
 int
-hakios_mt6781_ufs_crumb(const char *text)
+mapple_mt6781_ufs_crumb(const char *text)
 {
 	uint64_t ns;
 	int error, n;
@@ -1505,7 +1496,7 @@ hakios_mt6781_ufs_crumb(const char *text)
 	return error;
 }
 
-/* ---- the data volume: darwin from DATA_FIRST to its end ---- */
+/* the data volume: darwin from DATA_FIRST to its end */
 
 static uint64_t
 data_bytes(void)
@@ -1671,8 +1662,6 @@ data_ioctl(u_long cmd, caddr_t data)
 	}
 }
 
-/* ---- the devices ---- */
-
 static int
 mufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 {
@@ -1824,7 +1813,7 @@ mufs_devsw(void)
 
 /* mtkufs_root=1 (IOFindBSDRoot): xnusys as the root */
 int
-hakios_mtk_ufs_root(dev_t *root)
+mapple_mtk_ufs_root(dev_t *root)
 {
 	if (mufs_start() != 0) {
 		return ENXIO;
@@ -1840,9 +1829,9 @@ hakios_mtk_ufs_root(dev_t *root)
 	return 0;
 }
 
-/* from hakios_input_init, devfs up: started if the root did not start it, and the nodes */
+/* from mapple_input_init, devfs up: started if the root did not start it, and the nodes */
 void
-hakios_mt6781_ufs_init(void)
+mapple_mt6781_ufs_init(void)
 {
 	if (mufs_start() != 0 || mufs_devsw() != 0) {
 		return;
@@ -1884,7 +1873,7 @@ hakios_mt6781_ufs_init(void)
  * back in. No locks (a stopped processor may hold one), no printf.
  */
 void
-hakios_mt6781_ufs_quiesce(void)
+mapple_mt6781_ufs_quiesce(void)
 {
 	uint32_t left = 0, cnr = 0;
 	bool ok;

@@ -1,5 +1,5 @@
 /*
- * viva (MT6781): MDP backend of AppleM2ScalerCSCDriver (VivaScaler.h): NV12 (420v/420f) -> BGRA at the same size on
+ * MT6781: MDP backend of AppleM2ScalerCSCDriver (MTKScaler.h): NV12 (420v/420f) -> BGRA at the same size on
  * the MDP engines RDMA0 -> WROT0, without the GCE command queue and without the SCP (MediaTek's userspace
  * libdpframework normally programs these engines; nothing public describes MT6781's values).
  *
@@ -27,27 +27,27 @@
  *   holds the data), HDR0/AAL0/TDSHP0 in relay with their sizes; mutex MOD0 = 0x3FF; all PQ clocks on (CG 0xAFC3).
  * - RGB is converted to YUV full range in RDMA (TRANSFORM_0 = 0x10000) and back in WROT (MAT_CTRL 0x41); RSZ0 with
  *   use121filter, coefficient steps and algorithms of MediaTek's rsz_fw (6 taps up, cubic accumulation down).
- *   WROT writes a fixed alpha 0xFF: only for opaque content. Boot-arg vivamdprgb: 0 = no RGB on the MDP, 1 (default)
+ *   WROT writes a fixed alpha 0xFF: only for opaque content. Boot-arg mp_mdp_rgb: 0 = no RGB on the MDP, 1 (default)
  *   = sources whose sampled alpha is all 0xFF, 2 = every BGRA source (alpha lost).
  * - the vertical scaler's line buffer holds ~272 output pixels: frames go in vertical strips of 256 output columns,
  *   each a frame of its own with the RSZ horizontal phase of its first column (accumulation: offset in the SUB field
  *   only; 6 taps: INT/SUB with the chroma INT at 0). Measured: 1125x48 -> 787x34 in 4 strips, max error 3 levels
  *   against a bilinear reference.
  *
- * Boot-arg vivascaler=2 enables it (VivaScaler.cpp); vivamdpmax = largest frame in pixels for the bounce buffers
+ * Boot-arg mp_scaler=2 enables it (MTKScaler.cpp); mp_mdp_max = largest frame in pixels for the bounce buffers
  * (default 1125x2448, the screen).
  */
 #include <pexpert/arm64/board_config.h>
 
-#if defined(SWEET)
+#if defined(MT6781)
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 
-#include "VivaScaler.h"
-#include "SweetSurface.h"
+#include "MTKScaler.h"
+#include "MappleSurface.h"
 
 #define FOURCC(a, b, c, d)      (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 #define PF_BGRA                 FOURCC('B', 'G', 'R', 'A')
@@ -162,13 +162,13 @@
 #define MDP_RDMA_MAX_W          1024    /* input columns per strip (keeps the RDMA tile in what was measured) */
 #define MDP_TIMEOUT_MS          100
 
-struct viva_mdp {
+struct mapple_mdp {
 	IOMemoryMap *spm, *mdp;
 	IOBufferMemoryDescriptor *srcBuf, *dstBuf;
 	uint64_t srcPA, dstPA;
 	size_t srcSize, dstSize;
 	uint64_t frames, strips, timeouts, rgbFrames, rgbAlpha;
-	uint32_t rgbMode;       /* vivamdprgb: 0 off, 1 opaque sources only (sampled alpha), 2 always (alpha 0xFF) */
+	uint32_t rgbMode;       /* mp_mdp_rgb: 0 off, 1 opaque sources only (sampled alpha), 2 always (alpha 0xFF) */
 };
 
 static inline uint32_t rd(IOMemoryMap *m, uint32_t off) { return *(volatile uint32_t *)(m->getVirtualAddress() + off); }
@@ -214,14 +214,14 @@ cacheClean(const void *p, size_t len)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
-struct viva_mdp *
-viva_mdp_create(void)
+struct mapple_mdp *
+mapple_mdp_create(void)
 {
 	uint32_t maxPixels = 1125 * 2448;
-	PE_parse_boot_argn("vivamdpmax", &maxPixels, sizeof(maxPixels));
+	PE_parse_boot_argn_alias("mp_mdp_max", "vivamdpmax", &maxPixels, sizeof(maxPixels));
 	uint32_t rgbMode = 1;
-	PE_parse_boot_argn("vivamdprgb", &rgbMode, sizeof(rgbMode));
-	struct viva_mdp *m = (struct viva_mdp *)IOMallocZero(sizeof(*m));
+	PE_parse_boot_argn_alias("mp_mdp_rgb", "vivamdprgb", &rgbMode, sizeof(rgbMode));
+	struct mapple_mdp *m = (struct mapple_mdp *)IOMallocZero(sizeof(*m));
 	if (m == NULL) {
 		return NULL;
 	}
@@ -237,16 +237,16 @@ viva_mdp_create(void)
 		OSSafeReleaseNULL(m->mdp);
 		OSSafeReleaseNULL(m->srcBuf);
 		OSSafeReleaseNULL(m->dstBuf);
-		IOFreeType(m, struct viva_mdp);
+		IOFreeType(m, struct mapple_mdp);
 		return NULL;
 	}
-	IOLog("VIVA MDP: NV12 -> BGRA and BGRA scaling on RDMA0 -> (RSZ0) -> WROT0 (bounce buffers for %u pixels)\n", maxPixels);
+	IOLog("MDP: NV12 -> BGRA and BGRA scaling on RDMA0 -> (RSZ0) -> WROT0 (bounce buffers for %u pixels)\n", maxPixels);
 	return m;
 }
 
 /* Clocks, larb2, engine reset, routing: every time (the DIS domain may have been off since the last frame). */
 static bool
-setup(struct viva_mdp *m)
+setup(struct mapple_mdp *m)
 {
 	if (!(rd(m->spm, SPM_PWR_STATUS) & DIS_STATUS)) {
 		return false;           /* panel off: the MDP is unpowered, the CPU does it */
@@ -279,7 +279,7 @@ setup(struct viva_mdp *m)
 
 /* One strip: NV12 (y, uv at physical addresses, stride ys) -> BGRA (dst, stride ds), w x h pixels. */
 static bool
-strip(struct viva_mdp *m, uint64_t y, uint64_t uv, uint32_t ys, uint64_t dst, uint32_t ds, uint32_t w, uint32_t h,
+strip(struct mapple_mdp *m, uint64_t y, uint64_t uv, uint32_t ys, uint64_t dst, uint32_t ds, uint32_t w, uint32_t h,
     uint32_t mat)
 {
 	wr(m->mdp, SW0_RST_B, ~0x301u);
@@ -340,7 +340,7 @@ strip(struct viva_mdp *m, uint64_t y, uint64_t uv, uint32_t ys, uint64_t dst, ui
 
 /* Physical address of a whole surface when it is one contiguous range below 4 GiB, else 0. */
 static uint64_t
-contiguousPA(SweetSurface *s)
+contiguousPA(MappleSurface *s)
 {
 	IOByteCount len = 0;
 	uint64_t pa = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
@@ -348,12 +348,12 @@ contiguousPA(SweetSurface *s)
 }
 
 static IOReturn
-nv12Transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
+nv12Transfer(struct mapple_mdp *m, MappleSurface *src, MappleSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
     uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
 {
 	/* NV12 -> BGRA, whole surfaces, same size, no transform */
 	if ((src->pixelFormat != PF_420V && src->pixelFormat != PF_420F) || src->planeCount < 2 ||
-	    dst->pixelFormat != PF_BGRA || dst->bytesPerElement != 4 || (flags & kVivaScalerFlagTransformMask)) {
+	    dst->pixelFormat != PF_BGRA || dst->bytesPerElement != 4 || (flags & kMappleScalerFlagTransformMask)) {
 		return kIOReturnUnsupported;
 	}
 	uint32_t w = src->width & ~1u, h = src->height & ~1u;
@@ -404,14 +404,14 @@ nv12Transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t 
 	}
 	if (!ok) {
 		m->timeouts++;
-		IOLog("VIVA MDP: %ux%u NV12 -> BGRA timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", w, h,
+		IOLog("MDP: %ux%u NV12 -> BGRA timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", w, h,
 		    rd(m->mdp, WROT_DEBUG), rd(m->mdp, 0x3408));
 		return kIOReturnTimeout;
 	}
 	if (bounceOut) {
 		cacheClean(m->dstBuf->getBytesNoCopy(), dSize);        /* drop stale lines */
 		memcpy((uint8_t *)dk + dst->offset, m->dstBuf->getBytesNoCopy(), dSize);
-		sweet_surface_cpu_wrote(dst);
+		mapple_surface_cpu_wrote(dst);
 	}
 	m->frames++;
 	return kIOReturnSuccess;
@@ -453,7 +453,7 @@ rszAxis(uint32_t in, uint32_t out)
 
 /* One vertical strip: input columns [ix0, ix1) of the source -> output columns [k0, k1). */
 static bool
-rszStrip(struct viva_mdp *m, uint64_t src, uint32_t sstride, uint32_t iw, uint32_t ih, uint64_t dst, uint32_t dstride,
+rszStrip(struct mapple_mdp *m, uint64_t src, uint32_t sstride, uint32_t iw, uint32_t ih, uint64_t dst, uint32_t dstride,
     uint32_t ow, uint32_t oh, uint32_t k0, uint32_t k1)
 {
 	struct rsz_axis h = rszAxis(iw, ow), v = rszAxis(ih, oh);
@@ -588,11 +588,11 @@ rszStrip(struct viva_mdp *m, uint64_t src, uint32_t sstride, uint32_t iw, uint32
 }
 
 static IOReturn
-rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
+rgbTransfer(struct mapple_mdp *m, MappleSurface *src, MappleSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
     uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
 {
 	if (src->pixelFormat != PF_BGRA || dst->pixelFormat != PF_BGRA || src->bytesPerElement != 4 || dst->bytesPerElement != 4 ||
-	    (flags & kVivaScalerFlagTransformMask)) {
+	    (flags & kMappleScalerFlagTransformMask)) {
 		return kIOReturnUnsupported;
 	}
 	/* source rectangle in 16.16 (integer pixels only), destination in pixels; all zero = whole surface */
@@ -627,7 +627,7 @@ rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t s
 		if (sk == 0) {
 			return kIOReturnUnsupported;
 		}
-		sweet_surface_before_cpu_access(src);
+		mapple_surface_before_cpu_access(src);
 		uint32_t ys = ih / 64 ? ih / 64 : 1, xs = iw / 64 ? iw / 64 : 1;
 		for (uint32_t y = 0; y < ih; y += ys) {
 			const uint8_t *row = (const uint8_t *)sk + src->offset + (size_t)(y0 + y) * src->bytesPerRow + (size_t)x0 * 4;
@@ -679,7 +679,7 @@ rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t s
 	}
 	if (!ok) {
 		m->timeouts++;
-		IOLog("VIVA MDP: %ux%u -> %ux%u BGRA scale timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", iw, ih, dw, dh,
+		IOLog("MDP: %ux%u -> %ux%u BGRA scale timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", iw, ih, dw, dh,
 		    rd(m->mdp, WROT_DEBUG), rd(m->mdp, 0x3408));
 		return kIOReturnTimeout;
 	}
@@ -690,7 +690,7 @@ rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t s
 			memcpy((uint8_t *)dk + dst->offset + (size_t)(dy + r) * dst->bytesPerRow + (size_t)dx * 4, b + (size_t)r * dw * 4,
 			    (size_t)dw * 4);
 		}
-		sweet_surface_cpu_wrote(dst);
+		mapple_surface_cpu_wrote(dst);
 	}
 	m->frames++;
 	m->rgbFrames++;
@@ -698,7 +698,7 @@ rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t s
 }
 
 IOReturn
-viva_mdp_transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
+mapple_mdp_transfer(struct mapple_mdp *m, MappleSurface *src, MappleSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
     uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
 {
 	if (src->pixelFormat == PF_BGRA) {
@@ -710,4 +710,4 @@ viva_mdp_transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint
 	return nv12Transfer(m, src, dst, sx, sy, sw, sh, dx, dy, dw, dh, flags);
 }
 
-#endif /* SWEET */
+#endif /* MT6781 */

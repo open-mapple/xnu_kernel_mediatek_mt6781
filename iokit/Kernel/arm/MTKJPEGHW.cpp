@@ -1,5 +1,5 @@
 /*
- * viva (MT6781): the hardware JPEG encoder (jpgenc@17030000) driven with physical addresses (VivaJPEG.h).
+ * MT6781: the hardware JPEG encoder (jpgenc@17030000) driven with physical addresses (MTKJPEG.h).
  *
  * Sequence validated by hand on the phone over the USB link (2026-11-05, gpu/docs/JPGENC-MT6781.md): venc_sel
  * mux = mainpll_d3, VEN MTCMOS on (SPM VEN_PWR_CON 0x10006348: PWR_ON, PWR_ON_2ND, status bit 18 in
@@ -16,14 +16,14 @@
  */
 #include <pexpert/arm64/board_config.h>
 
-#if defined(SWEET)
+#if defined(MT6781)
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 
-#include "VivaJPEG.h"
+#include "MTKJPEG.h"
 
 #define PA_TOPCKGEN     0x10000000ull
 #define PA_INFRACFG     0x10001000ull
@@ -95,7 +95,7 @@
 
 #define JE_TIMEOUT_MS           500
 
-struct viva_jpgenc {
+struct mapple_jpgenc {
 	IOMemoryMap *topck, *infra, *spm, *gcon, *larb, *jpg;
 	IOBufferMemoryDescriptor *src, *dst;
 	uint64_t srcPA, dstPA;
@@ -150,14 +150,14 @@ contiguous(size_t size, uint64_t *pa)
 
 /* VEN power domain, clocks, larb7 ports: once (the block stays on; it draws nothing while idle and clock-gated). */
 static bool
-powerOn(struct viva_jpgenc *j)
+powerOn(struct mapple_jpgenc *j)
 {
 	if (j->powered) {
 		return true;
 	}
 	/* the parent domain (DIS, bit 21) is on whenever the display is */
 	if (!(rd(j->spm, SPM_PWR_STATUS) & (1u << 21))) {
-		IOLog("VIVA JPEG: display power domain off\n");
+		IOLog("JPEG: display power domain off\n");
 		return false;
 	}
 	wr(j->topck, CLK_CFG_9_CLR, 0x7);
@@ -175,7 +175,7 @@ powerOn(struct viva_jpgenc *j)
 			IODelay(10);
 		}
 		if (!(rd(j->spm, SPM_PWR_STATUS) & VEN_STATUS_BIT)) {
-			IOLog("VIVA JPEG: VEN power domain did not come up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
+			IOLog("JPEG: VEN power domain did not come up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
 			return false;
 		}
 		v &= ~PWR_CLK_DIS;
@@ -190,7 +190,7 @@ powerOn(struct viva_jpgenc *j)
 			IODelay(10);
 		}
 		if (rd(j->spm, SPM_VEN_PWR_CON) & SRAM_PDN_ACK) {
-			IOLog("VIVA JPEG: VEN SRAM did not power up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
+			IOLog("JPEG: VEN SRAM did not power up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
 			return false;
 		}
 		wr(j->infra, INFRA_TOPAXI_PROTECTEN_CLR, VEN_PROT_STEP2);
@@ -207,19 +207,19 @@ powerOn(struct viva_jpgenc *j)
 	wr(j->jpg, JE_RSTB, 1);
 	(void)rd(j->jpg, JE_ULTRA_THRES);
 	if (rd(j->jpg, JE_DMA_ADDR0) == 0xffffffff) {
-		IOLog("VIVA JPEG: jpgenc not answering on the APB bus\n");
+		IOLog("JPEG: jpgenc not answering on the APB bus\n");
 		return false;
 	}
 	wr(j->jpg, JE_CODEC_SEL, 0);
 	j->powered = true;
-	IOLog("VIVA JPEG: jpgenc powered (VEN 0x%08x, VENC_CG 0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON), rd(j->gcon, VENC_CG));
+	IOLog("JPEG: jpgenc powered (VEN 0x%08x, VENC_CG 0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON), rd(j->gcon, VENC_CG));
 	return true;
 }
 
-struct viva_jpgenc *
-viva_jpgenc_create(size_t maxPixels)
+struct mapple_jpgenc *
+mapple_jpgenc_create(size_t maxPixels)
 {
-	struct viva_jpgenc *j = (struct viva_jpgenc *)IOMallocZero(sizeof(*j));
+	struct mapple_jpgenc *j = (struct mapple_jpgenc *)IOMallocZero(sizeof(*j));
 	if (j == NULL) {
 		return NULL;
 	}
@@ -235,15 +235,15 @@ viva_jpgenc_create(size_t maxPixels)
 	j->dst = contiguous(j->dstSize, &j->dstPA);
 	if (j->topck == NULL || j->infra == NULL || j->spm == NULL || j->gcon == NULL || j->larb == NULL || j->jpg == NULL ||
 	    j->src == NULL || j->dst == NULL || !powerOn(j)) {
-		IOLog("VIVA JPEG: hardware encoder unavailable\n");
-		viva_jpgenc_destroy(j);
+		IOLog("JPEG: hardware encoder unavailable\n");
+		mapple_jpgenc_destroy(j);
 		return NULL;
 	}
 	return j;
 }
 
 void
-viva_jpgenc_destroy(struct viva_jpgenc *j)
+mapple_jpgenc_destroy(struct mapple_jpgenc *j)
 {
 	if (j == NULL) {
 		return;
@@ -256,7 +256,7 @@ viva_jpgenc_destroy(struct viva_jpgenc *j)
 	OSSafeReleaseNULL(j->jpg);
 	OSSafeReleaseNULL(j->src);
 	OSSafeReleaseNULL(j->dst);
-	IOFreeType(j, struct viva_jpgenc);
+	IOFreeType(j, struct mapple_jpgenc);
 }
 
 static uint32_t
@@ -268,12 +268,12 @@ qualityIndex(uint32_t q)
 }
 
 IOReturn
-viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, uint32_t quality, void *out,
+mapple_jpgenc_encode(struct mapple_jpgenc *j, const struct mapple_jpgenc_image *img, uint32_t quality, void *out,
     size_t outCap, size_t *outLen, uint32_t *cyclesOut)
 {
 	*outLen = 0;
-	bool yuyv = img->format == kVivaJpegYUYV;
-	if (img->format != kVivaJpegNV12 && img->format != kVivaJpegNV21 && !yuyv) {
+	bool yuyv = img->format == kMappleJpegYUYV;
+	if (img->format != kMappleJpegNV12 && img->format != kMappleJpegNV21 && !yuyv) {
 		return kIOReturnUnsupported;
 	}
 	uint32_t w = img->width, h = img->height;
@@ -323,7 +323,7 @@ viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, u
 	wr(j->jpg, JE_CODEC_SEL, 0);
 	wr(j->jpg, JE_INT_STS, 0);
 	wr(j->jpg, JE_IMG_SIZE, (w << 16) | h);
-	uint32_t fmt = yuyv ? 0 : img->format == kVivaJpegNV12 ? 2 : 3;
+	uint32_t fmt = yuyv ? 0 : img->format == kMappleJpegNV12 ? 2 : 3;
 	wr(j->jpg, JE_CTRL, fmt << JE_CTRL_FMT_SHIFT);
 	wr(j->jpg, JE_BLK_NUM, yuyv ? (padW / 16) * (padH / 8) * 4 - 1 : (padW / 16) * (padH / 16) * 6 - 1);
 	wr(j->jpg, JE_IMG_STRIDE, stride);
@@ -352,7 +352,7 @@ viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, u
 		j->failures++;
 		wr(j->jpg, JE_RSTB, 0);
 		wr(j->jpg, JE_RSTB, 1);
-		IOLog("VIVA JPEG: encode %ux%u failed, status 0x%x (%s)\n", w, h, sts, sts == 0 ? "timeout" :
+		IOLog("JPEG: encode %ux%u failed, status 0x%x (%s)\n", w, h, sts, sts == 0 ? "timeout" :
 		    (sts & JE_INT_STALL) ? "output full" : "codec error");
 		return sts == 0 ? kIOReturnTimeout : kIOReturnError;
 	}
@@ -372,7 +372,7 @@ viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, u
 }
 
 void
-viva_jpgenc_stats(struct viva_jpgenc *j, uint64_t *encodes, uint64_t *failures, uint64_t *bytes, uint64_t *cycles)
+mapple_jpgenc_stats(struct mapple_jpgenc *j, uint64_t *encodes, uint64_t *failures, uint64_t *bytes, uint64_t *cycles)
 {
 	*encodes = j->encodes;
 	*failures = j->failures;
@@ -380,4 +380,4 @@ viva_jpgenc_stats(struct viva_jpgenc *j, uint64_t *encodes, uint64_t *failures, 
 	*cycles = j->cycles;
 }
 
-#endif /* SWEET */
+#endif /* MT6781 */

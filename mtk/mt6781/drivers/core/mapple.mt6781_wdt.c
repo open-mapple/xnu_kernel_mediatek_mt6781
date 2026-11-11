@@ -1,14 +1,13 @@
 /*
- * The MT6781's watchdog (TOPRGU at 0x10007000), kept from firing during a run: boot-arg mtk_wdt_kick=1. mtkloader
- * arms it before XNU (31 s, the most its length takes); a kernel thread here restarts its count every 5 s by writing
- * the restart key to WDT_RST, as MediaTek's mtk_wdt driver pings it. Nothing else of the watchdog is written: mode
- * and length stay as mtkloader set them. So a run can last longer than 31 s (loader_return_after= still ends it), and
- * a kernel that stops scheduling threads -- a hang with interrupts off, a panic spinning -- still ends in its reset.
+ * The MT6781's watchdog (TOPRGU at 0x10007000), kept from firing: boot-arg mtk_wdt_kick=1. mtkloader arms it before
+ * XNU (31 s, the longest it takes); a thread writes the restart key to WDT_RST every 5 s, as MediaTek's mtk_wdt
+ * driver does. Only WDT_RST is written; mode and length stay as mtkloader set them, so a kernel that stops
+ * scheduling threads (a hang with interrupts off, a spinning panic) still ends in its reset.
  */
 #include <kern/thread.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -44,7 +43,7 @@ kicker(__unused void *arg, __unused wait_result_t wr)
 }
 
 void
-hakios_mt6781_wdt_init(void)
+mapple_mt6781_wdt_init(void)
 {
 	uint32_t on = 0, mode;
 	thread_t th;

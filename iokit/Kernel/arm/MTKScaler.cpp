@@ -1,8 +1,8 @@
 /*
- * viva (MT6781): AppleM2ScalerCSCDriver (see VivaScaler.h), the IOSurfaceAccelerator service.
+ * MT6781: AppleM2ScalerCSCDriver (see MTKScaler.h), the IOSurfaceAccelerator service.
  *
  * Selectors (ABI from iOS 16.7.16's IOSurfaceAccelerator.framework):
- *   1  Transfer/Transform/Blit: struct in 0x170 bytes (viva_scaler_request), nothing out. Done synchronously;
+ *   1  Transfer/Transform/Blit: struct in 0x170 bytes (mapple_scaler_request), nothing out. Done synchronously;
  *      with a callback and no SkipAsyncCallback the completion goes to the port registered with
  *      IOConnectSetNotificationPort(type 0) as kIOAsyncCompletionNotificationType with one argument (refcon2):
  *      QuartzCore releases the surfaces of a copy only in that callback. On an error the call fails and no
@@ -13,7 +13,7 @@
  *   7  performance stats configuration: success
  *   0, 8, 9  capture, kernel tests, histogram: kIOReturnUnsupported
  *
- * Backends: the MDP engines (VivaMDP.cpp, vivascaler=2) and the CPU. The CPU path reads the source through the
+ * Backends: the MDP engines (MTKMDP.cpp, mp_scaler=2) and the CPU. The CPU path reads the source through the
  * kernel mapping after the GPU jobs on both surfaces are done and the CPU's stale lines are dropped, writes the
  * destination and marks it CPU-dirty with a new seed, like an IOSurfaceLock/Unlock pair would (the Metal driver
  * copies surfaces in again only when the seed moved).
@@ -25,7 +25,7 @@
  */
 #include <pexpert/arm64/board_config.h>
 
-#if defined(SWEET)
+#if defined(MT6781)
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSNumber.h>
@@ -33,12 +33,12 @@
 #include <mach/mach_time.h>
 #include <kern/clock.h>
 
-#include "VivaScaler.h"
-#include "SweetSurface.h"
+#include "MTKScaler.h"
+#include "MappleSurface.h"
 
 extern "C" void iokit_release_port_send(ipc_port_t port);
 
-static_assert(sizeof(struct viva_scaler_request) == 0x170, "selector 1 request is 0x170 bytes");
+static_assert(sizeof(struct mapple_scaler_request) == 0x170, "selector 1 request is 0x170 bytes");
 
 #define FOURCC(a, b, c, d)      (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 #define PF_BGRA                 FOURCC('B', 'G', 'R', 'A')
@@ -101,23 +101,23 @@ bool
 AppleM2ScalerCSCDriver::start(IOService *provider)
 {
 	int mode = 0;
-	PE_parse_boot_argn("vivascaler", &mode, sizeof(mode));
+	PE_parse_boot_argn_alias("mp_scaler", "vivascaler", &mode, sizeof(mode));
 	if (mode <= 0) {
-		IOLog("VIVA SCALER: off (boot-arg vivascaler=1 CPU, 2 MDP)\n");
+		IOLog("SCALER: off (boot-arg mp_scaler=1 CPU, 2 MDP)\n");
 		return false;
 	}
 	fFormats = 3;
-	PE_parse_boot_argn("vivascalerformats", &fFormats, sizeof(fFormats));
+	PE_parse_boot_argn_alias("mp_scaler_formats", "vivascalerformats", &fFormats, sizeof(fFormats));
 	fCpuMax = 65536;
-	PE_parse_boot_argn("vivascalercpumax", &fCpuMax, sizeof(fCpuMax));
+	PE_parse_boot_argn_alias("mp_scaler_cpumax", "vivascalercpumax", &fCpuMax, sizeof(fCpuMax));
 	fLock = IOLockAlloc();
 	if (fLock == NULL || !IOService::start(provider)) {
 		return false;
 	}
 	if (mode >= 2) {
-		fMdp = viva_mdp_create();
+		fMdp = mapple_mdp_create();
 		if (fMdp == NULL) {
-			IOLog("VIVA SCALER: MDP unavailable, CPU backend\n");
+			IOLog("SCALER: MDP unavailable, CPU backend\n");
 			mode = 1;
 		}
 	}
@@ -127,13 +127,13 @@ AppleM2ScalerCSCDriver::start(IOService *provider)
 		setProperty("IOSurfaceAcceleratorCapabilitiesDict", caps);
 		caps->release();
 	}
-	setProperty("VivaScalerBackend", fMode >= 2 ? "mdp" : "cpu");
-	setProperty("VivaScalerFormats", fFormats, 32);
-	setProperty("VivaScalerCpuMax", fCpuMax, 32);
+	setProperty("MTKScalerBackend", fMode >= 2 ? "mdp" : "cpu");
+	setProperty("MTKScalerFormats", fFormats, 32);
+	setProperty("MTKScalerCpuMax", fCpuMax, 32);
 	setProperty("IOUserClientClass", "AppleM2ScalerCSCDriverUserClient");
 	publishStats();
 	registerService();
-	IOLog("VIVA SCALER: AppleM2ScalerCSCDriver published (backend %s, formats 0x%x)\n",
+	IOLog("SCALER: AppleM2ScalerCSCDriver published (backend %s, formats 0x%x)\n",
 	    fMode >= 2 ? "mdp" : "cpu", fFormats);
 	return true;
 }
@@ -178,7 +178,7 @@ AppleM2ScalerCSCDriver::publishStats(void)
 	setNumber(d, "us", fNs / 1000);
 	setNumber(d, "customFilters", fCustomFilters);
 	setNumber(d, "clients", fClients);
-	setProperty("VivaScalerStats", d);
+	setProperty("MTKScalerStats", d);
 	d->release();
 }
 
@@ -274,7 +274,7 @@ sample(const src_view *s, int64_t fx, int64_t fy, uint32_t x0, uint32_t y0, uint
 }
 
 static IOReturn
-cpuTransfer(SweetSurface *src, SweetSurface *dst, uint64_t sx, uint64_t sy, uint64_t sw, uint64_t sh,
+cpuTransfer(MappleSurface *src, MappleSurface *dst, uint64_t sx, uint64_t sy, uint64_t sw, uint64_t sh,
     uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags, uint32_t alphaOverride, uint64_t *bytes)
 {
 	src_view s = {};
@@ -321,10 +321,10 @@ cpuTransfer(SweetSurface *src, SweetSurface *dst, uint64_t sx, uint64_t sy, uint
 	uint32_t x1 = (uint32_t)((sx + sw + 0xffff) >> 16), y1 = (uint32_t)((sy + sh + 0xffff) >> 16);
 	x1 = x1 > s.w ? s.w : x1;
 	y1 = y1 > s.h ? s.h : y1;
-	bool nearest = (flags & kVivaScalerFlagNearest) != 0;
+	bool nearest = (flags & kMappleScalerFlagNearest) != 0;
 	int64_t stepX = (int64_t)((sw << 16) / dw), stepY = (int64_t)((sh << 16) / dh);     /* 16.16 */
 	bool copy = !s.yuv && stepX == 0x10000 && stepY == 0x10000 && (sx & 0xffff) == 0 && (sy & 0xffff) == 0 &&
-	    src->pixelFormat == dst->pixelFormat && !(flags & kVivaScalerFlagAlphaOverride);
+	    src->pixelFormat == dst->pixelFormat && !(flags & kMappleScalerFlagAlphaOverride);
 	uint8_t *dbase = (uint8_t *)dk + dst->offset;
 	for (uint32_t j = 0; j < dh; j++) {
 		uint8_t *row = dbase + (size_t)(dy + j) * dst->bytesPerRow + (size_t)dx * 4;
@@ -337,7 +337,7 @@ cpuTransfer(SweetSurface *src, SweetSurface *dst, uint64_t sx, uint64_t sy, uint
 			int64_t fx = (int64_t)sx + stepX * i + stepX / 2;
 			int32_t px[4];
 			sample(&s, fx, fy, x0, y0, x1, y1, nearest, px);
-			if (flags & kVivaScalerFlagAlphaOverride) {
+			if (flags & kMappleScalerFlagAlphaOverride) {
 				px[3] = (int32_t)(alphaOverride & 0xff);
 			}
 			uint8_t *p = row + (size_t)i * 4;
@@ -353,11 +353,11 @@ cpuTransfer(SweetSurface *src, SweetSurface *dst, uint64_t sx, uint64_t sy, uint
 /* ---- Transfer ----------------------------------------------------------------------------------------------- */
 
 IOReturn
-AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, SweetSurface *src, SweetSurface *dst,
+AppleM2ScalerCSCDriver::transferLocked(const struct mapple_scaler_request *req, MappleSurface *src, MappleSurface *dst,
     const char **backend)
 {
 	uint64_t flags = req->flags;
-	if ((flags & kVivaScalerFlagTransformMask) != 0) {
+	if ((flags & kMappleScalerFlagTransformMask) != 0) {
 		return kIOReturnUnsupported;    /* flip / rotate */
 	}
 	bool srcYuv = src->pixelFormat == PF_420V || src->pixelFormat == PF_420F;
@@ -365,23 +365,23 @@ AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, Sw
 		return kIOReturnUnsupported;
 	}
 	/* the GPU jobs on both surfaces first (they may still be drawing the source or reading the destination) */
-	if (!viva_gpu_surface_idle(src, NULL)) {
-		viva_gpu_surface_wait(src, SCALER_GPU_WAIT_MS);
+	if (!mapple_gpu_surface_idle(src, NULL)) {
+		mapple_gpu_surface_wait(src, SCALER_GPU_WAIT_MS);
 	}
-	if (!viva_gpu_surface_idle(dst, NULL)) {
-		viva_gpu_surface_wait(dst, SCALER_GPU_WAIT_MS);
+	if (!mapple_gpu_surface_idle(dst, NULL)) {
+		mapple_gpu_surface_wait(dst, SCALER_GPU_WAIT_MS);
 	}
 	IOReturn ret = kIOReturnUnsupported;
 	uint64_t bytes = 0;
 	if (fMdp != NULL) {
 		/* the engines read memory: the CPU's dirty lines of the source go out first */
-		sweet_surface_before_device_read(src);
-		sweet_surface_before_device_read(dst);
-		ret = viva_mdp_transfer(fMdp, src, dst, (uint32_t)req->srcX, (uint32_t)req->srcY, (uint32_t)req->srcW,
+		mapple_surface_before_device_read(src);
+		mapple_surface_before_device_read(dst);
+		ret = mapple_mdp_transfer(fMdp, src, dst, (uint32_t)req->srcX, (uint32_t)req->srcY, (uint32_t)req->srcW,
 		    (uint32_t)req->srcH, req->dstX, req->dstY, req->dstW, req->dstH, flags);
 		if (ret == kIOReturnSuccess) {
-			sweet_surface_device_wrote(dst);
-			sweet_surface_seed_bump(dst);
+			mapple_surface_device_wrote(dst);
+			mapple_surface_seed_bump(dst);
 			*backend = "mdp";
 			fMdpDone++;
 			return ret;
@@ -392,17 +392,17 @@ AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, Sw
 		uint64_t dw = req->dstW ? req->dstW : dst->width, dh = req->dstH ? req->dstH : dst->height;
 		bool same = src->pixelFormat == dst->pixelFormat && !srcYuv &&
 		    (req->srcW == 0 || req->srcW == dw << 16) && (req->srcH == 0 || req->srcH == dh << 16) &&
-		    (req->srcW != 0 || (src->width == dw && src->height == dh)) && !(flags & kVivaScalerFlagAlphaOverride);
+		    (req->srcW != 0 || (src->width == dw && src->height == dh)) && !(flags & kMappleScalerFlagAlphaOverride);
 		if (!same && dw * dh > fCpuMax) {
 			return kIOReturnUnsupported;
 		}
 	}
-	sweet_surface_before_cpu_access(src);
-	sweet_surface_before_cpu_access(dst);
+	mapple_surface_before_cpu_access(src);
+	mapple_surface_before_cpu_access(dst);
 	ret = cpuTransfer(src, dst, req->srcX, req->srcY, req->srcW, req->srcH, req->dstX, req->dstY, req->dstW,
 	    req->dstH, flags, req->alphaOverride, &bytes);
 	if (ret == kIOReturnSuccess) {
-		sweet_surface_cpu_wrote(dst);
+		mapple_surface_cpu_wrote(dst);
 		*backend = "cpu";
 		fCpu++;
 		fBytes += bytes;
@@ -411,9 +411,9 @@ AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, Sw
 }
 
 IOReturn
-AppleM2ScalerCSCDriver::transfer(const struct viva_scaler_request *req, __unused task_t task)
+AppleM2ScalerCSCDriver::transfer(const struct mapple_scaler_request *req, __unused task_t task)
 {
-	SweetSurface *src = sweet_surface_copy(req->srcID), *dst = sweet_surface_copy(req->dstID);
+	MappleSurface *src = mapple_surface_copy(req->srcID), *dst = mapple_surface_copy(req->dstID);
 	IOReturn ret;
 	const char *backend = "";
 	uint64_t t0 = mach_absolute_time();
@@ -442,7 +442,7 @@ AppleM2ScalerCSCDriver::transfer(const struct viva_scaler_request *req, __unused
 			publishStats();
 		}
 		if (fTransfers <= 16 || (ret != kIOReturnSuccess && fErrors + fUnsupported <= 32)) {
-			IOLog("VIVA SCALER: %u (%ux%u '%c%c%c%c') -> %u (%ux%u '%c%c%c%c') flags 0x%llx: 0x%x %s\n",
+			IOLog("SCALER: %u (%ux%u '%c%c%c%c') -> %u (%ux%u '%c%c%c%c') flags 0x%llx: 0x%x %s\n",
 			    src->id, src->width, src->height, (char)(src->pixelFormat >> 24), (char)(src->pixelFormat >> 16),
 			    (char)(src->pixelFormat >> 8), (char)src->pixelFormat, dst->id, dst->width, dst->height,
 			    (char)(dst->pixelFormat >> 24), (char)(dst->pixelFormat >> 16), (char)(dst->pixelFormat >> 8),
@@ -514,13 +514,13 @@ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMe
 {
 	switch (selector) {
 	case 1: {
-		if (args->structureInput == NULL || args->structureInputSize != sizeof(struct viva_scaler_request)) {
+		if (args->structureInput == NULL || args->structureInputSize != sizeof(struct mapple_scaler_request)) {
 			return kIOReturnBadArgument;
 		}
-		struct viva_scaler_request req;
+		struct mapple_scaler_request req;
 		memcpy(&req, args->structureInput, sizeof(req));
 		IOReturn ret = fOwner->transfer(&req, fTask);
-		if (ret == kIOReturnSuccess && req.callback != 0 && !(req.flags & kVivaScalerFlagSkipAsync) &&
+		if (ret == kIOReturnSuccess && req.callback != 0 && !(req.flags & kMappleScalerFlagSkipAsync) &&
 		    fPort != MACH_PORT_NULL) {
 			OSAsyncReference64 ref = {};
 			setAsyncReference64(ref, fPort, (mach_vm_address_t)req.callback, (io_user_reference_t)req.refcon, fTask);
@@ -555,4 +555,4 @@ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMe
 	}
 }
 
-#endif /* SWEET */
+#endif /* MT6781 */

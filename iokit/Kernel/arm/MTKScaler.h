@@ -1,34 +1,34 @@
 /*
- * viva (MT6781): AppleM2ScalerCSCDriver, the service behind IOSurfaceAccelerator.framework (scaling, colour
+ * MT6781: AppleM2ScalerCSCDriver, the service behind IOSurfaceAccelerator.framework (scaling, colour
  * conversion and copies between IOSurfaces). User-client ABI reverse-engineered from iOS 16.7.16 (20H392):
  * gpu/docs/ABI-IOSURFACEACCELERATOR.md in the viva-gpu repository.
  *
- * Boot-arg vivascaler (the Viva Manager app sets it, MaliMetal > Acceleratori):
+ * Boot-arg mp_scaler (the Viva Manager app sets it, MaliMetal > Acceleratori):
  *   0 (default)  the service is not published: every client falls back as before (QuartzCore to the GPU,
  *                VideoToolbox to software conversions)
  *   1            published, transfers done by the CPU in the kernel (backend "cpu")
  *   2            published, transfers on the MDP engines (RDMA -> RSZ -> WROT) when the format and size allow it,
  *                the CPU otherwise (backend "mdp"; needs the MDP power domain: falls back to 1 if it is off)
- * vivascalerformats (bitmask, default 3): 1 = 32-bit RGB (BGRA/RGBA/ARGB), 2 = 4:2:0 biplanar (420v/420f) as
+ * mp_scaler_formats (bitmask, default 3): 1 = 32-bit RGB (BGRA/RGBA/ARGB), 2 = 4:2:0 biplanar (420v/420f) as
  *   source. Formats outside the mask are refused with kIOReturnUnsupported, which every client handles by
  *   falling back (VideoToolbox propagates errors of a published service, hence the mask).
  *
- * vivascalercpumax (pixels, default 65536): largest destination the CPU scales or converts. Bigger requests that the MDP
+ * mp_scaler_cpumax (pixels, default 65536): largest destination the CPU scales or converts. Bigger requests that the MDP
  *   cannot take are refused with kIOReturnUnsupported: QuartzCore then does them on the GPU as without the service
  *   (its switcher/snapshot reductions of the whole screen, 1125x2436 -> 787x1705, cost tens of milliseconds on the
  *   CPU against ~2 ms on the GPU). Same-size copies of one RGB format are always done (one memcpy per row).
  *
- * Counters: property "VivaScalerStats" of the service (ioreg / Viva Manager).
+ * Counters: property "MTKScalerStats" of the service (ioreg / Viva Manager).
  */
-#ifndef _IOKIT_ARM_VIVASCALER_H
-#define _IOKIT_ARM_VIVASCALER_H
+#ifndef _IOKIT_ARM_MTKSCALER_H
+#define _IOKIT_ARM_MTKSCALER_H
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOLocks.h>
 
 /* Selector 1 request (0x170 bytes), see the ABI document section 2.2 */
-struct viva_scaler_request {
+struct mapple_scaler_request {
 	uint32_t srcID, dstID;
 	uint64_t callback, refcon, refcon2;
 	uint64_t flags;
@@ -45,17 +45,17 @@ struct viva_scaler_request {
 };
 
 enum {
-	kVivaScalerFlagTransformMask    = 0x7,
-	kVivaScalerFlagNearest          = 1ull << 7,
-	kVivaScalerFlagSkipAsync        = 1ull << 10,
-	kVivaScalerFlagAlphaOverride    = 1ull << 18,
-	kVivaScalerFlagBorderFill       = 1ull << 28,
-	kVivaScalerFlagHistogram        = 1ull << 29,
-	kVivaScalerFlagZeroFill         = 1ull << 30,
+	kMappleScalerFlagTransformMask    = 0x7,
+	kMappleScalerFlagNearest          = 1ull << 7,
+	kMappleScalerFlagSkipAsync        = 1ull << 10,
+	kMappleScalerFlagAlphaOverride    = 1ull << 18,
+	kMappleScalerFlagBorderFill       = 1ull << 28,
+	kMappleScalerFlagHistogram        = 1ull << 29,
+	kMappleScalerFlagZeroFill         = 1ull << 30,
 };
 
-class SweetSurface;
-struct viva_mdp;
+class MappleSurface;
+struct mapple_mdp;
 
 class AppleM2ScalerCSCDriver : public IOService {
 	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
@@ -65,11 +65,11 @@ public:
 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 
 	/* Selector 1: does the transfer (synchronously) and returns its status. */
-	IOReturn transfer(const struct viva_scaler_request *req, task_t task);
+	IOReturn transfer(const struct mapple_scaler_request *req, task_t task);
 	void noteCustomFilter(void) { fCustomFilters++; }
 
 private:
-	IOReturn transferLocked(const struct viva_scaler_request *req, SweetSurface *src, SweetSurface *dst,
+	IOReturn transferLocked(const struct mapple_scaler_request *req, MappleSurface *src, MappleSurface *dst,
 	    const char **backend);
 	void publishStats(void);
 
@@ -77,7 +77,7 @@ private:
 	int       fMode;
 	uint32_t  fFormats;
 	uint32_t  fCpuMax;          /* largest destination (pixels) the CPU scales / converts */
-	struct viva_mdp *fMdp;      /* NULL = CPU only */
+	struct mapple_mdp *fMdp;      /* NULL = CPU only */
 	uint64_t  fTransfers, fCpu, fMdpDone, fUnsupported, fErrors, fBytes, fNs, fCustomFilters, fClients;
 	uint64_t  fLastPublish;
 };
@@ -100,13 +100,13 @@ private:
 };
 
 /*
- * MDP backend (VivaMDP.cpp). viva_mdp_create returns NULL when the engines cannot be used (power domain off,
- * boot-arg). viva_mdp_transfer returns kIOReturnUnsupported for anything it does not handle, so the caller
+ * MDP backend (MTKMDP.cpp). mapple_mdp_create returns NULL when the engines cannot be used (power domain off,
+ * boot-arg). mapple_mdp_transfer returns kIOReturnUnsupported for anything it does not handle, so the caller
  * falls back to the CPU.
  */
-struct viva_mdp *viva_mdp_create(void);
-IOReturn viva_mdp_transfer(struct viva_mdp *mdp, SweetSurface *src, SweetSurface *dst,
+struct mapple_mdp *mapple_mdp_create(void);
+IOReturn mapple_mdp_transfer(struct mapple_mdp *mdp, MappleSurface *src, MappleSurface *dst,
     uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
     uint64_t flags);
 
-#endif /* _IOKIT_ARM_VIVASCALER_H */
+#endif /* _IOKIT_ARM_MTKSCALER_H */

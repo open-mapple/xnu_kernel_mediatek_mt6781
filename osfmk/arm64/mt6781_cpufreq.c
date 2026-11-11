@@ -1,5 +1,5 @@
 /*
- * viva (MT6781): CPU DVFS for the two clusters (6x Cortex-A55 "LL", cpu 0-5; 2x Cortex-A76 "big", cpu 6-7) and the
+ * MT6781: CPU DVFS for the two clusters (6x Cortex-A55 "LL", cpu 0-5; 2x Cortex-A76 "big", cpu 6-7) and the
  * CCI, plus the scheduler hint that sends foreground threads to the A76s once they run fast.
  *
  * Nothing in this port touched the CPU clocks before: they stayed where LK left them (LL 1866 MHz, big 1085 MHz,
@@ -23,34 +23,34 @@
  * Governor (every 16 ms, 100 ms when everything idles at the floor): busy = 1 - idle/wall per CPU from recount, the
  * busiest CPU of a cluster counts. >= 80 % busy: the ceiling; else the slowest OPP that would be <= 50 % busy (0183;
  * 70 % before); lower OPPs only after 3 samples in a row. The CCI follows the faster cluster's OPP index. Ceilings:
- * boot-args, Low Power Mode (viva_cpufreq_set_lowpower, VivaBattery.cpp), thermal (viva_cpufreq_set_thermal_cap).
+ * boot-args, Low Power Mode (mt6781_cpufreq_set_lowpower, BQ27Z561Battery.cpp), thermal (mt6781_cpufreq_set_thermal_cap).
  *
  * UI boost (0183, gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md P1): a UI thread that works 8 ms of every 33 is 25 %
  * busy and never moved the clusters off the floor (Settings scrolled at 23 fps, 31 with the clocks at max). The
- * display (every SwapEnd, SweetFramebuffer.cpp) and the touch screen (every report, VivaGT9896.cpp) call
- * viva_cpufreq_ui_activity(); for vivacpuboostms (250) after the last call LL and big run at least at
- * vivacpuboost=MHz (default: their fastest OPP), still under every ceiling (thermal 0147, Low Power Mode, link).
- * The first signal after a quiet period samples at once instead of waiting up to 100 ms. vivacpuboostms=0 = off.
- * While boosted with the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's
+ * display (every SwapEnd, MappleFramebuffer.cpp) and the touch screen (every report, GT9896.cpp) call
+ * mt6781_cpufreq_ui_activity(); for mp_cpufreq_boost_ms (250) after the last call LL and big run at least at
+ * mp_cpufreq_boost=MHz (default: their fastest OPP), still under every ceiling (thermal 0147, Low Power Mode, link).
+ * The first signal after a quiet period samples at once instead of waiting up to 100 ms. mp_cpufreq_boost_ms=0 = off.
+ * While boosted with the A76 preference on (sched_mapple_fast_cpus), big never runs slower than 1.4 x an A55 at LL's
  * clock / 1.46 (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55.
  * If the big ceiling does not allow that, the preference is suspended until it does.
  *
- * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
- *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
- *   in Low Power Mode (1530; LL 1500, CCI 1050); vivacpufast=0 no scheduler preference for the A76s.
+ * Boot-args: mp_cpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
+ *   mp_cpufreq_big=MHz / mp_cpufreq_ll=MHz / mp_cpufreq_cci=MHz ceilings (default 2050/2000/1400); mp_lpm_cpu=MHz big ceiling
+ *   in Low Power Mode (1530; LL 1500, CCI 1050); mp_cpufreq_fast=0 no scheduler preference for the A76s.
  * Thermal (0147): the SoC's LVTS sensors (thermal controller 0x1100b000, 3 controllers at +0/+0x100/+0x200:
  *   LL x3 + CAM, big x2, MD + GPU x2), brought up as Linux's mtk_ts_cpu_noBank probe (mt6781 mtk_lvts_tc.c,
  *   AUTO-RCK): thermal clock on (INFRA_AO CG bit 10), controller reset, device id 0x81+n, device init, efuse
  *   calibration (devinfo of this phone: golden 60, count_r per sensor below), 20 ms periodic sampling.
  *   T = -204.65 * raw / 16384 + golden / 2 + 204.65 (degrees). Read every 256 ms by the governor. Policy on the
- *   hottest sensor: >= vivathermtrip (85 C) one OPP lower for both clusters every sample, below trip - 5 C one OPP
+ *   hottest sensor: >= mp_therm_trip (85 C) one OPP lower for both clusters every sample, below trip - 5 C one OPP
  *   up every second, >= 105 C straight to the floor. Without valid readings the clusters are capped at opp 6
  *   (LL 1618, big 1670). The controller's hardware reset protection (TOPRGU thermal mode) is NOT armed.
- *   vivatherm=0 = no LVTS (cap at opp 6).
+ *   mp_therm=0 = no LVTS (cap at opp 6).
  * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
  *   cpu fast on|off | cpu boost on|off | cpu reset (counters).
  */
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 #include <stdint.h>
 #include <string.h>
 #include <kern/misc_protos.h>
@@ -62,28 +62,28 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
-extern int viva_pwrap_read(uint32_t addr, uint32_t *value);                          /* VivaPwrap.cpp */
-extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
-extern uint64_t sched_viva_fast_cpus;                                                /* kern/sched_prim.c */
+extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                          /* MTKPwrap.cpp */
+extern int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
+extern uint64_t sched_mapple_fast_cpus;                                                /* kern/sched_prim.c */
 
 #define NOPP 16
-struct viva_opp {
+struct mapple_opp {
 	uint16_t mhz;
 	uint8_t vsel;
 	uint8_t pd;
 };
 
-static const struct viva_opp kOppLL[NOPP] = {
+static const struct mapple_opp kOppLL[NOPP] = {
 	{ 2000, 85, 1 }, { 1933, 81, 1 }, { 1866, 77, 1 }, { 1800, 72, 1 }, { 1733, 68, 1 }, { 1666, 64, 2 },
 	{ 1618, 60, 2 }, { 1500, 57, 2 }, { 1375, 52, 2 }, { 1275, 48, 2 }, { 1175, 44, 2 }, { 1075, 40, 2 },
 	{ 975, 36, 2 }, { 875, 32, 2 }, { 774, 28, 4 }, { 500, 16, 4 },
 };
-static const struct viva_opp kOppBig[NOPP] = {
+static const struct mapple_opp kOppBig[NOPP] = {
 	{ 2050, 99, 1 }, { 1986, 95, 1 }, { 1923, 90, 1 }, { 1860, 86, 1 }, { 1796, 82, 1 }, { 1733, 77, 1 },
 	{ 1670, 73, 1 }, { 1530, 66, 2 }, { 1419, 60, 2 }, { 1308, 55, 2 }, { 1169, 48, 2 }, { 1085, 44, 2 },
 	{ 1002, 39, 2 }, { 919, 35, 2 }, { 835, 31, 2 }, { 774, 28, 4 },
 };
-static const struct viva_opp kOppCCI[NOPP] = {
+static const struct mapple_opp kOppCCI[NOPP] = {
 	{ 1400, 85, 2 }, { 1330, 79, 2 }, { 1260, 72, 2 }, { 1190, 65, 2 }, { 1155, 62, 2 }, { 1120, 58, 2 },
 	{ 1050, 55, 2 }, { 980, 51, 2 }, { 927, 48, 2 }, { 875, 45, 2 }, { 822, 43, 2 }, { 752, 39, 4 },
 	{ 682, 35, 4 }, { 612, 31, 4 }, { 560, 28, 4 }, { 500, 16, 4 },
@@ -91,7 +91,7 @@ static const struct viva_opp kOppCCI[NOPP] = {
 
 enum { DOM_LL, DOM_BIG, DOM_CCI, NDOM };
 static const char *const kDomName[NDOM] = { "ll", "big", "cci" };
-static const struct viva_opp *const kOpp[NDOM] = { kOppLL, kOppBig, kOppCCI };
+static const struct mapple_opp *const kOpp[NDOM] = { kOppLL, kOppBig, kOppCCI };
 static const uint64_t kPllCon1[NDOM] = { 0x1000c204, 0x1000c214, 0x1000c2a4 };
 static const uint64_t kCkDiv[NDOM] = { 0x0c53a2a0, 0x0c53a2a4, 0x0c53a2e0 };
 #define FHCTL_HP_EN     0x1000ce00
@@ -107,13 +107,13 @@ static const uint64_t kCkDiv[NDOM] = { 0x0c53a2a0, 0x0c53a2a4, 0x0c53a2e0 };
 #define BIG_FIRST       6
 #define BIG_LAST        7
 
-static LCK_GRP_DECLARE(viva_cpufreq_grp, "viva_cpufreq");
-static LCK_MTX_DECLARE(viva_cpufreq_lock, &viva_cpufreq_grp);
+static LCK_GRP_DECLARE(mt6781_cpufreq_grp, "mt6781_cpufreq");
+static LCK_MTX_DECLARE(mt6781_cpufreq_lock, &mt6781_cpufreq_grp);
 
-static int gMode = 1;           /* vivacpufreq */
+static int gMode = 1;           /* mp_cpufreq */
 static bool gReady;             /* init passed its checks */
 static bool gGov;               /* governor running */
-static bool gFast = true;       /* vivacpufast */
+static bool gFast = true;       /* mp_cpufreq_fast */
 static bool gLowPower;
 static int gIdx[NDOM];          /* current OPP index */
 static int gBootIdx[NDOM];
@@ -129,10 +129,10 @@ static uint64_t gLastAt;
 static const char *gWhy = "not started";
 static thread_call_t gCall;
 /* 0183 UI boost */
-static bool gBoost = true;              /* vivacpuboostms != 0, "cpu boost on|off" */
-static int gBoostIdx[NDOM];             /* vivacpuboost: LL and big at least this fast while boosted */
-static uint64_t gBoostAbs;              /* vivacpuboostms in mach time */
-static volatile uint64_t gBoostUntil;   /* written without the lock by viva_cpufreq_ui_activity */
+static bool gBoost = true;              /* mp_cpufreq_boost_ms != 0, "cpu boost on|off" */
+static int gBoostIdx[NDOM];             /* mp_cpufreq_boost: LL and big at least this fast while boosted */
+static uint64_t gBoostAbs;              /* mp_cpufreq_boost_ms in mach time */
+static volatile uint64_t gBoostUntil;   /* written without the lock by mt6781_cpufreq_ui_activity */
 static volatile bool gBoosting;         /* the last sample was boosted */
 static volatile bool gSlowPoll;         /* the governor sleeps 100 ms */
 static uint64_t gBoostSignals, gBoostStarts, gBoostTime, gBoostLastTick;
@@ -162,7 +162,7 @@ static int
 vproc_read(int rail11, uint32_t *vsel)
 {
 	uint32_t v = 0;
-	int err = viva_pwrap_read(rail11 ? VPROC11_DBG0 : VPROC12_DBG0, &v);
+	int err = mtk_pwrap_read(rail11 ? VPROC11_DBG0 : VPROC12_DBG0, &v);
 	*vsel = v & 0x7f;
 	return err;
 }
@@ -179,7 +179,7 @@ vproc_set(int rail11, uint32_t vsel)
 		return true;
 	}
 	gVoltWrites++;
-	if (viva_pwrap_write_regulator(rail11 ? VPROC11_ELR0 : VPROC12_ELR0, 0x7f, vsel) != 0) {
+	if (mtk_pwrap_write_regulator(rail11 ? VPROC11_ELR0 : VPROC12_ELR0, 0x7f, vsel) != 0) {
 		return false;
 	}
 	for (int i = 0; i < 200; i++) {
@@ -195,7 +195,7 @@ vproc_set(int rail11, uint32_t vsel)
 
 /* Linux adjust_posdiv / adjust_armpll_dds order: posdiv up before the PCW write, down after it. */
 static void
-pll_set(int d, const struct viva_opp *o)
+pll_set(int d, const struct mapple_opp *o)
 {
 	uint64_t pa = kPllCon1[d];
 	uint32_t con1 = rd(pa);
@@ -304,7 +304,7 @@ update_fast_map(void)
 			}
 		}
 	}
-	sched_viva_fast_cpus = m;
+	sched_mapple_fast_cpus = m;
 }
 
 /* Busy per mille of the busiest CPU in [first, last] since the last sample. */
@@ -355,7 +355,7 @@ static void
 gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	bool slow = false;
-	lck_mtx_lock(&viva_cpufreq_lock);
+	lck_mtx_lock(&mt6781_cpufreq_lock);
 	if (gGov && gReady) {
 		int want[NDOM];
 		gSamples++;
@@ -409,13 +409,13 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		if (!apply(want)) {
 			gGov = false;
 			update_fast_map();
-			printf("VIVA CPUFREQ: %s, governor stopped\n", gWhy);
+			printf("CPUFREQ: %s, governor stopped\n", gWhy);
 		}
 		slow = !boost && gIdx[DOM_LL] == FLOOR_IDX && gIdx[DOM_BIG] == FLOOR_IDX && gBusy[DOM_CCI] < 100;
 	}
 	gSlowPoll = slow;
 	bool again = gGov && gReady;
-	lck_mtx_unlock(&viva_cpufreq_lock);
+	lck_mtx_unlock(&mt6781_cpufreq_lock);
 	if (again) {
 		uint64_t deadline;
 		clock_interval_to_deadline(slow ? 100 : 16, NSEC_PER_MSEC, &deadline);
@@ -472,7 +472,7 @@ init_checks(void)
 		}
 		gIdx[d] = gBootIdx[d] = found;
 	}
-	if (viva_pwrap_read(VSRAM11_TRACK0, &t11) != 0 || viva_pwrap_read(VSRAM12_TRACK0, &t12) != 0 ||
+	if (mtk_pwrap_read(VSRAM11_TRACK0, &t11) != 0 || mtk_pwrap_read(VSRAM12_TRACK0, &t12) != 0 ||
 	    (t11 & 6) != 6 || (t12 & 6) != 6) {
 		gWhy = "Vsram tracking off";
 		return false;
@@ -640,10 +640,10 @@ therm_tick(void)
 
 /*
  * 0183: the display presented a frame or the touch screen reported a contact (any thread, never blocks; not from
- * interrupt context). Boosts LL and big for vivacpuboostms from now (see the top).
+ * interrupt context). Boosts LL and big for mp_cpufreq_boost_ms from now (see the top).
  */
 void
-viva_cpufreq_ui_activity(void)
+mt6781_cpufreq_ui_activity(void)
 {
 	if (!gBoost || !gGov) {
 		return;
@@ -658,7 +658,7 @@ viva_cpufreq_ui_activity(void)
 
 /* 0183: Viva Manager / "gpu kv": boost on, rising edges, time boosted (ms), activity signals. */
 void
-viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals)
+mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals)
 {
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(gBoostTime, &ns);
@@ -668,22 +668,23 @@ viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *sign
 	*signals = gBoostSignals;
 }
 
-/* Called from VivaPwrap::start (the PMIC is reachable from then on). */
+/* Called from MTKPwrap::start (the PMIC is reachable from then on). */
 void
-viva_cpufreq_start(void)
+mt6781_cpufreq_start(void)
 {
 	unsigned v = 0;
-	if (PE_parse_boot_argn("vivacpufreq", &v, sizeof(v))) {
+	if (PE_parse_boot_argn_alias("mp_cpufreq", "vivacpufreq", &v, sizeof(v))) {
 		gMode = (int)v;
 	}
-	if (PE_parse_boot_argn("vivacpufast", &v, sizeof(v))) {
+	if (PE_parse_boot_argn_alias("mp_cpufreq_fast", "vivacpufast", &v, sizeof(v))) {
 		gFast = v != 0;
 	}
 	unsigned def[NDOM] = { 2000, 2050, 1400 }, lpm[NDOM] = { 1500, 1530, 1050 };
-	const char *const arg[NDOM] = { "vivacpull", "vivacpubig", "vivacpucci" };
+	const char *const arg[NDOM] = { "mp_cpufreq_ll", "mp_cpufreq_big", "mp_cpufreq_cci" };
+	const char *const old[NDOM] = { "vivacpull", "vivacpubig", "vivacpucci" };
 	for (int d = 0; d < NDOM; d++) {
 		unsigned mhz = def[d];
-		(void)PE_parse_boot_argn(arg[d], &mhz, sizeof(mhz));
+		(void)PE_parse_boot_argn_alias(arg[d], old[d], &mhz, sizeof(mhz));
 		gMaxIdx[d] = idx_for_mhz(d, mhz);
 		while (gMaxIdx[d] < NOPP - 1 && kOpp[d][gMaxIdx[d]].mhz > mhz) {
 			gMaxIdx[d]++;
@@ -694,8 +695,8 @@ viva_cpufreq_start(void)
 		}
 	}
 	unsigned boostMhz = 0, boostMs = 250;
-	(void)PE_parse_boot_argn("vivacpuboost", &boostMhz, sizeof(boostMhz));
-	(void)PE_parse_boot_argn("vivacpuboostms", &boostMs, sizeof(boostMs));
+	(void)PE_parse_boot_argn_alias("mp_cpufreq_boost", "vivacpuboost", &boostMhz, sizeof(boostMhz));
+	(void)PE_parse_boot_argn_alias("mp_cpufreq_boost_ms", "vivacpuboostms", &boostMs, sizeof(boostMs));
 	gBoost = boostMs != 0;
 	nanoseconds_to_absolutetime((uint64_t)(boostMs > 5000 ? 5000 : boostMs) * NSEC_PER_MSEC, &gBoostAbs);
 	for (int d = DOM_LL; d <= DOM_BIG; d++) {
@@ -707,28 +708,28 @@ viva_cpufreq_start(void)
 			}
 		}
 	}
-	if (PE_parse_boot_argn("vivalpmcpu", &v, sizeof(v))) {
+	if (PE_parse_boot_argn_alias("mp_lpm_cpu", "vivalpmcpu", &v, sizeof(v))) {
 		gLpmIdx[DOM_BIG] = idx_for_mhz(DOM_BIG, v);
 		while (gLpmIdx[DOM_BIG] < NOPP - 1 && kOppBig[gLpmIdx[DOM_BIG]].mhz > v) {
 			gLpmIdx[DOM_BIG]++;
 		}
 	}
 	if (gMode == 0) {
-		gWhy = "off (vivacpufreq=0)";
-		printf("VIVA CPUFREQ: off (vivacpufreq=0), clocks left as LK set them\n");
+		gWhy = "off (mp_cpufreq=0)";
+		printf("CPUFREQ: off (mp_cpufreq=0), clocks left as LK set them\n");
 		return;
 	}
 	unsigned th = 1;
-	(void)PE_parse_boot_argn("vivatherm", &th, sizeof(th));
-	(void)PE_parse_boot_argn("vivathermtrip", &gTrip, sizeof(gTrip));
+	(void)PE_parse_boot_argn_alias("mp_therm", "vivatherm", &th, sizeof(th));
+	(void)PE_parse_boot_argn_alias("mp_therm_trip", "vivathermtrip", &gTrip, sizeof(gTrip));
 	gTrip = gTrip < 60 ? 60 : gTrip > 100 ? 100 : gTrip;
 	gTherm = th != 0 && lvts_init();
 	if (th == 0) {
-		gThermWhy = "off (vivatherm=0)";
+		gThermWhy = "off (mp_therm=0)";
 	}
 	gThermIdx = THERM_NOVALID_CAP;          /* until the first valid reading */
 	gCall = thread_call_allocate_with_options(gov_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
-	lck_mtx_lock(&viva_cpufreq_lock);
+	lck_mtx_lock(&mt6781_cpufreq_lock);
 	gReady = init_checks();
 	if (gReady) {
 		gWhy = "ok";
@@ -737,30 +738,30 @@ viva_cpufreq_start(void)
 			gov_start();
 		}
 	}
-	lck_mtx_unlock(&viva_cpufreq_lock);
-	printf("VIVA THERMAL: LVTS %s\n", gThermWhy);
-	printf("VIVA CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG),
+	lck_mtx_unlock(&mt6781_cpufreq_lock);
+	printf("THERMAL: LVTS %s\n", gThermWhy);
+	printf("CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG),
 	    pll_mhz(DOM_CCI), !gReady ? "disabled" : gMode == 1 ? "governor on" : "manual (link)");
 }
 
 void
-viva_cpufreq_set_lowpower(int on)
+mt6781_cpufreq_set_lowpower(int on)
 {
-	lck_mtx_lock(&viva_cpufreq_lock);
+	lck_mtx_lock(&mt6781_cpufreq_lock);
 	gLowPower = on != 0;
 	update_fast_map();
-	lck_mtx_unlock(&viva_cpufreq_lock);
+	lck_mtx_unlock(&mt6781_cpufreq_lock);
 }
 
 /* Thermal ceiling for both clusters as an OPP index (0 = none); applied at the next governor sample. */
 void
-viva_cpufreq_set_thermal_cap(int idx)
+mt6781_cpufreq_set_thermal_cap(int idx)
 {
 	gThermIdx = idx < 0 ? 0 : idx > FLOOR_IDX ? FLOOR_IDX : idx;
 }
 
 int
-viva_cpufreq_thermal_cap(void)
+mt6781_cpufreq_thermal_cap(void)
 {
 	return gThermIdx;
 }
@@ -797,12 +798,12 @@ word_end(const char *s)
 }
 
 void
-viva_cpufreq_link(const char *args, char *out, size_t len)
+mt6781_cpufreq_link(const char *args, char *out, size_t len)
 {
 	size_t o = 0;
 	const char *a = skip(args ? args : "");
 	out[0] = 0;
-	lck_mtx_lock(&viva_cpufreq_lock);
+	lck_mtx_lock(&mt6781_cpufreq_lock);
 	if (strncmp(a, "gov", 3) == 0) {
 		const char *b = skip(word_end(a));
 		if (strncmp(b, "on", 2) == 0) {
@@ -815,7 +816,7 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 		const char *b = skip(word_end(a));
 		gFast = strncmp(b, "off", 3) != 0;
 		update_fast_map();
-		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFast ? "on" : "off", sched_viva_fast_cpus);
+		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFast ? "on" : "off", sched_mapple_fast_cpus);
 	} else if (strncmp(a, "boost", 5) == 0) {
 		const char *b = skip(word_end(a));
 		if (strncmp(b, "on", 2) == 0) {
@@ -875,7 +876,7 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 		account_time();
 		SAY("cpufreq: %s, governor %s, mode %d, low power %s, thermal cap opp %d, A76 preference %s (0x%llx)\n",
 		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gThermIdx, gFast ? "on" : "off",
-		    sched_viva_fast_cpus);
+		    sched_mapple_fast_cpus);
 		SAY("  thermal: %s, trip %d C, hottest %d.%d C (peak %d.%d C), cap opp %d, %llu steps down, %llu up\n  ",
 		    gThermWhy, gTrip, gTempMax / 1000, (gTempMax % 1000 + 1000) % 1000 / 100, gTempPeak / 1000,
 		    (gTempPeak % 1000 + 1000) % 1000 / 100, gThermIdx, gThermStepsDown, gThermStepsUp);
@@ -914,6 +915,6 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
 		}
 		SAY("usage: cpu [status] | gov on|off | set ll|big|cci MHz | max ll|big|cci MHz | fast on|off | boost on|off | reset\n");
 	}
-	lck_mtx_unlock(&viva_cpufreq_lock);
+	lck_mtx_unlock(&mt6781_cpufreq_lock);
 }
-#endif /* ARM64_BOARD_CONFIG_SWEET */
+#endif /* ARM64_BOARD_CONFIG_MT6781 */

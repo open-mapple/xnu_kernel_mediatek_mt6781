@@ -1,13 +1,11 @@
 /*
- * The MT6781's CPU temperature: boot-arg lvts_watch=N says every N s the nine LVTS sensors as MediaTek's
- * thermal driver reads them (three controllers at 0x1100b000, +0x100, +0x200; each result at +0x90 + 4 * n, bits 15..0,
- * bit 16 valid), in °C with the chip's golden value, which mtkloader (DVFS_PROBE=1) passes as lvts_golden=:
- *   lvts: 35 s: A55 41.2 41.0 41.5 cam 40.1 | A76 43.0 43.2 | md 39.0 gpu 39.1 39.0 | max 43.2 | 9 of 9 valid
- * A sensor reading 0 shows "-"; without lvts_golden the raw values are shown. They count only once SSPM runs them
- * (Linux asks it to): readings that never change mean they do not. While their clock (infra_therm: infracfg_ao +0x90
- * bit 10 set) is gated they are not read.
+ * The MT6781's CPU temperature: boot-arg lvts_watch=N logs every N s the nine LVTS sensors as MediaTek's thermal
+ * driver reads them (three controllers at 0x1100b000, +0x100, +0x200; each result at +0x90 + 4 * n, bits 15..0,
+ * bit 16 valid), in °C with the chip's golden value, which mtkloader (DVFS_PROBE=1) passes as lvts_golden=.
+ * A sensor reading 0 shows "-"; without lvts_golden the raw values are shown. While their clock (infra_therm:
+ * infracfg_ao +0x90 bit 10 set) is gated they are not read.
  *
- * Nothing brings LVTS up under XNU (Linux's thermal driver does it, not SSPM), so boot-arg lvts_init=N takes its
+ * Nothing brings LVTS up under XNU (Linux's thermal driver does it, not SSPM), so boot-arg lvts_init=N does its
  * bring-up in numbered steps, in the order MediaTek's driver has it; writes only to the thermal controllers and the
  * thermal block's reset bit:
  *   1  the block reset (infracfg_ao +0x120/+0x124 bit 0, set then cleared; only that bit written); for each
@@ -26,7 +24,7 @@
 #include <kern/thread.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -132,10 +130,10 @@ put_c(char *line, int at, int size, const char *name, int mc)
 /*
  * For MT6781_DVFS: how many of the nine sensors have a reading now, and the hottest of those in m°C (*mc). A reading is
  * a non-zero raw value, as MediaTek's driver takes it: the valid bit (16) is only reported there, and reading a sensor
- * seems to clear it (two reads in a row: 9 valid, then 0).
+ * seems to clear it.
  */
 int
-hakios_mt6781_lvts_hottest(int *mc)
+mapple_mt6781_lvts_hottest(int *mc)
 {
 	int valid = 0;
 
@@ -320,7 +318,7 @@ init_step4(void)
 }
 
 void
-hakios_mt6781_lvts_init(void)
+mapple_mt6781_lvts_init(void)
 {
 	thread_t th;
 	uint32_t step = 0;

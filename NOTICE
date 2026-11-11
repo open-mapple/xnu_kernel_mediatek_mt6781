@@ -1,0 +1,9 @@
+Open Mapple: the MediaTek MT6781's layer of the XNU kernel.
+
+- mtk/mt6781/: built into Apple's XNU, so under the Apple Public Source License 2.0 (LICENSE.APSL), as HakiOS's
+  kernel code is. Started in HakiOS (github.com/oosexgang/hakios-xnu-kernel).
+- osfmk/arm64/viva_cpufreq.c and iokit/Kernel/arm/Viva{MDP,Scaler,JPEG,JPEGHW}.*: from ios-viva
+  (github.com/Nik300/ios-viva). MIT, Copyright (c) 2026 dipa-studio (LICENSE).
+
+Register addresses, values and the order of hardware steps come from the phone's own device tree and from
+MediaTek's Linux sources as published by realme and Xiaomi (GPL-2.0), read, not copied.

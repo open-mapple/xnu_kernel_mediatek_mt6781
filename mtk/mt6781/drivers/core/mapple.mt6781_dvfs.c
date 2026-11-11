@@ -1,30 +1,28 @@
 /*
  * SSPM's CPU DVFS on the MT6781, started as MediaTek's hybrid DVFS driver starts it (cpuhvfs, SSPM v2): boot-arg
- * dvfs_step=N, steps 1 to N, from a kernel thread, and nothing written before all nine LVTS sensors have a reading
- * (MT6781_LVTS, lvts_init=4):
+ * dvfs_step=N, steps 1 to N, from a kernel thread. Nothing is written before all nine LVTS sensors have a reading
+ * (MT6781_LVTS, lvts_init=4).
  *   1  read only: LK's tables (mtkloader's dvfs_tbl=) against the CPU DVFS SRAM ("CSRAM") Android left: all 48 rows
- *      the same MHz and dividers, the guards there, the CCI map and IMAX table there (Android's: none after a cold
- *      power-on, and then nothing is done); the PLLs and the current OPP, Vproc and request words said
- *   2  the CSRAM as Linux lays it out: the CCI map and IMAX table kept aside, the guards, everything from +0x2a0 to the
- *      end cleared, the PPM limits (A55s all OPPs; A76s capped at OPP 7), the table from LK's (voltage step << 16 |
- *      MHz, clock divider << 16 | post divider), the CCI map, IMAX table and IMAX_EN back, IMAX_THERMAL_EN 1; the
- *      requests where LK left the clocks (A55s OPP 2, A76s OPP 11)
+ *      the same MHz and dividers, the guards, the CCI map and IMAX table present (none after a cold power-on, and
+ *      then nothing is done); the PLLs and the current OPP, Vproc and request words logged
+ *   2  the CSRAM as Linux lays it out: CCI map and IMAX table kept aside, the guards, +0x2a0 to the end cleared, the
+ *      PPM limits (A55s all OPPs; A76s capped at OPP 7), the table from LK's (voltage step << 16 | MHz, clock
+ *      divider << 16 | post divider), CCI map, IMAX table and IMAX_EN back, IMAX_THERMAL_EN 1; the requests where
+ *      LK left the clocks (A55s OPP 2, A76s OPP 11)
  *   3  SSPM told, on its CPU DVFS channel (mailbox 0 slot 26, the answer in mailbox 2 slot 24): INIT_PTBL (segment
  *      0), INIT (level 0), the scheduler's assist off (+0x2bc), CLUSTER_ON_OFF for both clusters; GET_FREQ of the A76s
- *   4  the A76s asked for OPP 7 (1530 MHz, request word +0x380); the PLL, GET_FREQ and the temperature after 100 ms
- * Then every 500 ms: at 75 °C or more on any sensor, the A76s asked for OPP 11 again, for the rest of the run; every
- * 5 s the A76s' PLL, the current OPPs and the hottest sensor said; what SSPM sends on its CPU DVFS notice channel
- * (mailbox 2 slot 10) read, said and cleared. A message not taken in 100 ms, or not answered in time: no further
- * step, the A76s back to OPP 11. mtkloader built with DVFS_RESET_END=1 ends such a run in a watchdog reset. Every line
- * also goes onto darwin at once with mtkufs_crumbs=1 (MT6781_UFS breadcrumbs), and one before each write that could
- * reset the phone.
+ *   4  the A76s asked for OPP 7 (1530 MHz, request word +0x380)
+ * Then every 500 ms: at 75 °C or more on any sensor, the A76s go back to OPP 11 for good; SSPM's notices (mailbox 2
+ * slot 10) read and cleared; every 5 s the state logged. A message not taken in 100 ms, or not answered in time: no
+ * further step, the A76s back to OPP 11. With mtkufs_crumbs=1 every line also goes to darwin at once (MT6781_UFS),
+ * including one before each write that could reset the phone.
  */
 #include <kern/clock.h>
 #include <stdarg.h>
 #include <kern/thread.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -90,7 +88,7 @@ say(const char *format, ...)
 	vsnprintf(line, sizeof(line), format, ap);
 	va_end(ap);
 	printf("%s\n", line);
-	(void)hakios_mt6781_ufs_crumb(line);
+	(void)mapple_mt6781_ufs_crumb(line);
 }
 
 static uint32_t
@@ -172,7 +170,7 @@ ipi(const char *what, uint32_t cmd, uint32_t a0, uint32_t a1, uint32_t wait_ms, 
 static void
 say_state(const char *when)
 {
-	int mc = 0, valid = hakios_mt6781_lvts_hottest(&mc);
+	int mc = 0, valid = mapple_mt6781_lvts_hottest(&mc);
 
 	say("dvfs (%s): PLL A55s %u MHz, A76s %u MHz; OPP now %u/%u/%u, Vproc %x/%x/%x, asked %u/%u, limits %08x/%08x; "
 	    "hottest %d.%d C (%d read); %u notices", when, pll_mhz(ARMPLL_LL_CON1), pll_mhz(ARMPLL_L_CON1),
@@ -289,7 +287,7 @@ run(__unused void *arg, __unused wait_result_t wr_)
 	if (!check() || step < 2) {
 		return;
 	}
-	while (hakios_mt6781_lvts_hottest(&mc) != 9) {
+	while (mapple_mt6781_lvts_hottest(&mc) != 9) {
 		if (waited++ == 120) {
 			say("dvfs: the temperature sensors not all read after 120 s (lvts_init=4 lvts_watch=): no DVFS "
 			    "writes");
@@ -334,7 +332,7 @@ run(__unused void *arg, __unused wait_result_t wr_)
 	for (uint32_t tick = 1;; tick++) {
 		IOSleep(500);
 		take_notices();
-		if (!cooled && hakios_mt6781_lvts_hottest(&mc) > 0 && mc >= HOT_MC) {
+		if (!cooled && mapple_mt6781_lvts_hottest(&mc) > 0 && mc >= HOT_MC) {
 			a76_back("75 C reached");
 			cooled = true;
 		}
@@ -345,7 +343,7 @@ run(__unused void *arg, __unused wait_result_t wr_)
 }
 
 void
-hakios_mt6781_dvfs_init(void)
+mapple_mt6781_dvfs_init(void)
 {
 	uint32_t at = 0;
 	thread_t th;

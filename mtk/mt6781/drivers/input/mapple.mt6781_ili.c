@@ -1,33 +1,30 @@
 /*
  * The realme 8i's touch screen: the touch half of the ILI7807S (display and touch in one chip) on SPI4 of the MT6781,
- * as a source of touches for /dev/hakios-touch (sys/hakios.input.h), the same path the Hot 20's hakios.tcm.c feeds.
+ * as a source of touches for /dev/mapple-touch (sys/mapple.input.h).
  * Boot-arg touchscreen=3; touchlog=1 logs every finger's landing and lifting and every eighth move.
  *
  * The chip keeps its firmware in RAM, and LK holds it in reset: mtkloader (XNU_TOUCH_ILI=1, mtk/loader/mtkili.h)
- * lets it out and sends the firmware on the way here, so by now it reports. All that is left is reading:
+ * lets it out and sends the firmware, so by now it reports. All that is left is reading:
  *   pins     GPIO13 data out, 14 data in, 144 clock, 145 chip select, driven by hand (mode 0, MSB first): SPI4's
- *            controller hung in mtkloader on anything but single short transfers, and a report is 46 bytes
+ *            controller hangs on anything but single short transfers, and a report is 46 bytes
  *   INT      GPIO12 / EINT 12 gives a short low pulse per report. It is not taken as an interrupt: EINT 12 is set
- *            to falling edge and unmasked, so that the edge is latched in EINT_STA (masked, it latched nothing in
- *            the first run, and 4 ms looks at the line caught 4 reports in 2.5 minutes), while the EINT block's
- *            own line into the GIC (SPI 186) is switched off at the distributor; a thread looks at the latch (and
- *            at the line itself) every touch_poll_us (4000) and reads one report when either says so
+ *            to falling edge and unmasked, so that the edge is latched in EINT_STA (masked, nothing latches), while
+ *            the EINT block's own line into the GIC (SPI 186) is switched off at the distributor; a thread looks at
+ *            the latch (and at the line itself) every touch_poll_us (4000) and reads one report when either says so
  *   lifts    a finger with no report for 150 ms is lifted: one missed last report must not become a long press
- *            (the first run's fingers stayed down for seconds and SpringBoard went into its editing mode)
  *   report   0x83, then 45 bytes back: two, the firmware's ACK 0xA3, and the 43-byte demo packet: 0x5A, ten
  *            fingers of four bytes (x high nibble | y high nibble, x low, y low, pressure; FF FF FF: none), and a
  *            checksum (minus the sum of the rest)
  *   place    0..2047 on the chip's grid; x * 1079 / 2047 and y * 2411 / 2047 on the 1080 x 2412 panel, then
- *            0..65535 across it for /dev/hakios-touch
- *   reload   the chip loses the firmware by itself (three runs: gone by the first read, the reset lines untouched),
- *            so when it answers without its ACK the firmware is sent again, as Android's driver does at every display
- *            resume and on its ESD check, and as mtkloader sends it: ICE mode with the MCU stopped, the blocks AP, DATA
- *            and TUNING, each checked against the chip's DMA CRC and its last four bytes, the code reset, ICE mode left.
- *            The firmware is mtkloader's own copy, still in memory under XNU: its table's address comes as ili_fw=
- *            (each block's CRC is checked here before it is used). At most every 2 s, and given up on after five
- *            failures in a row.
+ *            0..65535 across it for /dev/mapple-touch
+ *   reload   the chip loses the firmware by itself (the reset lines untouched), so when it answers without its
+ *            ACK the firmware is sent again, as Android's driver does at every display resume and on its ESD check,
+ *            and as mtkloader sends it: ICE mode with the MCU stopped, the blocks AP, DATA and TUNING, each checked
+ *            against the chip's DMA CRC and its last four bytes, the code reset, ICE mode left. The firmware is
+ *            mtkloader's own copy, still in memory under XNU: its table's address comes as ili_fw= (each block's
+ *            CRC is checked here before it is used). At most every 2 s; given up after five failures in a row.
  *   edge     after each load the firmware is told to reject palms at the edges (edge_palm on, 01 12 01, as Android's
- *            driver tells it at every resume): without it a hand holding the phone was a second finger at x = 0
+ *            driver tells it at every resume): without it a hand holding the phone is a second finger at x = 0
  * Besides those the only thing sent to the chip is the read command 0x83. Register layouts from MediaTek's MT6781
  * tables (pinctrl-mtk-mt6781.h, mtk-eint.c); the chip's framing from the ILITEK driver Android runs (ili9882n),
  * read, not copied.
@@ -37,7 +34,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -194,7 +191,7 @@ spi_read(uint8_t *rx, uint32_t len)
 	spi_xfer(&read_cmd, 1, rx, len);
 }
 
-/* ---- sending the firmware again ---- */
+/* sending the firmware again */
 
 static uint32_t
 crc32_msb(const volatile uint8_t *p, uint32_t len)
@@ -385,7 +382,7 @@ report(const uint8_t *p)
 		if (log_reports && (!down[f] || touches % 8 == 0)) {
 			printf("ili: f%u %s %u,%u p%u\n", f, down[f] ? "move" : "down", x, y, q[3]);
 		}
-		hakios_touch_post(down[f] ? HAKIOS_TOUCH_MOVE : HAKIOS_TOUCH_DOWN, f, across(x, PANEL_W), across(y, PANEL_H));
+		mapple_touch_post(down[f] ? MAPPLE_TOUCH_MOVE : MAPPLE_TOUCH_DOWN, f, across(x, PANEL_W), across(y, PANEL_H));
 		down[f] = seen[f] = true;
 		last_x[f] = x;
 		last_y[f] = y;
@@ -397,7 +394,7 @@ report(const uint8_t *p)
 			if (log_reports) {
 				printf("ili: f%u up %u,%u\n", f, last_x[f], last_y[f]);
 			}
-			hakios_touch_post(HAKIOS_TOUCH_UP, f, across(last_x[f], PANEL_W), across(last_y[f], PANEL_H));
+			mapple_touch_post(MAPPLE_TOUCH_UP, f, across(last_x[f], PANEL_W), across(last_y[f], PANEL_H));
 			down[f] = false;
 		}
 	}
@@ -499,7 +496,7 @@ ili_thread(__unused void *parameter, __unused wait_result_t result)
 						if (log_reports) {
 							printf("ili: f%u up %u,%u (no report for %u ms)\n", f, last_x[f], last_y[f], STALE_MS);
 						}
-						hakios_touch_post(HAKIOS_TOUCH_UP, f, across(last_x[f], PANEL_W), across(last_y[f], PANEL_H));
+						mapple_touch_post(MAPPLE_TOUCH_UP, f, across(last_x[f], PANEL_W), across(last_y[f], PANEL_H));
 						down[f] = false;
 						stale++;
 					}
@@ -518,7 +515,7 @@ ili_thread(__unused void *parameter, __unused wait_result_t result)
 }
 
 void
-hakios_mt6781_ili_init(void)
+mapple_mt6781_ili_init(void)
 {
 	uint32_t which = 0;
 	thread_t thread;

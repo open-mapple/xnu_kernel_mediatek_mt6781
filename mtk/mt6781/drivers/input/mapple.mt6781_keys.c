@@ -1,25 +1,23 @@
 /*
- * The buttons of the realme 8i (spaced, MT6781), as a source of button presses for /dev/hakios-touch
- * (sys/hakios.input.h). Only with boot-arg buttons=3: buttons=1 is the POCO's (hakios.buttons.c), buttons=2 the
- * Hot 20's (hakios.mtk_keys.c).
+ * The buttons of the realme 8i (spaced, MT6781), as button presses for /dev/mapple-touch (sys/mapple.input.h).
+ * Only with boot-arg buttons=3 (1 is the POCO's, 2 the Hot 20's).
  *
  * Where they are (Android's device tree, the kp@10010000 node; Android's kernel, mt-plat/mt6781 upmu_hw.h):
- *   volume down  the SoC's keypad, key 1 of its map (kpd-hw-init-map 0x72): bit 1 of KP_MEM1, clear while the
- *                key is down -- mtkloader's KEY_PROBE saw it go 0xffff -> 0xfbfd on the phone
+ *   volume down  the SoC's keypad, key 1 of its map (kpd-hw-init-map 0x72): bit 1 of KP_MEM1, clear while down
  *   volume up    the PMIC's "reset key" (kpd-sw-rstkey 0x73), an MT6358: HOMEKEY_DEB, bit 3 of TOPSTATUS
  *   power        the same PMIC: PWRKEY_DEB, bit 1 of TOPSTATUS
  * TOPSTATUS (0x28) is read through the PMIC wrapper's WACS2 channel (0x1000d000 + 0xc20, as on the MT6768 and
- * MT6785; LK's log on the phone has WACS1 at 0xc10). Its bits are clear while a key is down. Nothing interrupts:
- * a thread looks every 20 ms, and a key has to read the same twice in a row before it counts. Reads only.
+ * MT6785; LK uses WACS1 at 0xc10). Its bits are clear while a key is down. No interrupt: polled every 20 ms,
+ * and a key must read the same twice in a row to count. Reads only.
  *
- * Boot-arg keylog=1: a line for every change, to check the wiring against.
+ * Boot-arg keylog=1: a line for every change.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.input.h>
+#include <sys/mapple.input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -82,14 +80,14 @@ pmic_read(uint32_t reg, uint32_t *value)
 
 struct key {
 	const char *name;
-	uint32_t button;                /* HAKIOS_BUTTON_* */
+	uint32_t button;                /* MAPPLE_BUTTON_* */
 	bool down, seen;                /* what was reported, and what the last look found */
 };
 
 static struct key keys[3] = {
-	{ "volume up", HAKIOS_BUTTON_VOLUME_UP, false, false },
-	{ "volume down", HAKIOS_BUTTON_VOLUME_DOWN, false, false },
-	{ "power", HAKIOS_BUTTON_LOCK, false, false },
+	{ "volume up", MAPPLE_BUTTON_VOLUME_UP, false, false },
+	{ "volume down", MAPPLE_BUTTON_VOLUME_DOWN, false, false },
+	{ "power", MAPPLE_BUTTON_LOCK, false, false },
 };
 
 static void
@@ -118,7 +116,7 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 			/* the same twice in a row, or it is a bounce */
 			if (now[i] == k->seen && now[i] != k->down) {
 				k->down = now[i];
-				hakios_touch_post(k->down ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, k->button, 0, 0);
+				mapple_touch_post(k->down ? MAPPLE_BUTTON_DOWN : MAPPLE_BUTTON_UP, k->button, 0, 0);
 				presses += k->down;
 				if (log) {
 					printf("mt6781keys: %s %s (keypad %#x, PMIC %#x)\n", k->name, k->down ? "down" : "up", mem, top);
@@ -134,7 +132,7 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 }
 
 void
-hakios_mt6781_keys_init(void)
+mapple_mt6781_keys_init(void)
 {
 	uint32_t which = 0;
 	thread_t thread;
