@@ -651,7 +651,7 @@ lvts_calibration(void)
 	uint32_t golden = 0, n = 0;
 	memcpy(gCountR, kCountR, sizeof(gCountR));
 	if (!PE_parse_boot_argn_alias("mp_lvts_golden", "lvts_golden", &golden, sizeof(golden)) || golden == 0 || golden > 255 ||
-	    !PE_parse_boot_arg_str("mp_lvts_r", arg, sizeof(arg)) || arg[0] != 'r') {
+	    !PE_parse_boot_arg_str_alias("mp_lvts_r", "lvts_r", arg, sizeof(arg)) || arg[0] != 'r') {
 		return "built in";
 	}
 	uint32_t count[NSENS];
