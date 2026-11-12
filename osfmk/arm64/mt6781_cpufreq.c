@@ -509,9 +509,12 @@ init_checks(void)
 static const int kTcSensors[NTC] = { 4, 2, 3 };
 static const int kTcFirst[NTC] = { 0, 4, 6 };
 static const char *const kSensName[NSENS] = { "ll0", "ll1", "ll2", "cam", "big0", "big1", "md", "gpu0", "gpu1" };
-/* devinfo (atag,devinfo) of this phone: index 112 golden temp, 118.. count_r */
+/* devinfo (atag,devinfo) of viva: index 112 golden temp, 118.. count_r; another phone's come as mp_lvts_golden=/mp_lvts_r= */
 static const uint32_t kGolden = 60;
 static const uint32_t kCountR[NSENS] = { 19553, 19526, 19549, 19554, 19520, 19497, 19489, 19494, 19500 };
+static uint32_t gGolden = kGolden;
+static uint32_t gCountR[NSENS];
+static thread_call_t gThermCall;        /* mp_therm=1 with mp_cpufreq=0: readings only */
 
 static bool gTherm;             /* sensors initialised and valid */
 static int gTempMC[NSENS];
@@ -531,12 +534,45 @@ lvts_dev_write(int tc, uint32_t reg, uint32_t data)
 static int
 lvts_raw_to_mc(uint32_t raw)
 {
-	return (int)((-204650ll * (int64_t)raw) / 16384) + (int)kGolden * 500 + 204650;
+	return (int)((-204650ll * (int64_t)raw) / 16384) + (int)gGolden * 500 + 204650;
+}
+
+/* mtkloader's mp_lvts_golden=<n> and mp_lvts_r=r<hex>.<hex>... (efuse word 112 and the nine count_r, in this order) */
+static const char *
+lvts_calibration(void)
+{
+	char arg[128];
+	uint32_t golden = 0, n = 0;
+	memcpy(gCountR, kCountR, sizeof(gCountR));
+	if (!PE_parse_boot_argn_alias("mp_lvts_golden", "lvts_golden", &golden, sizeof(golden)) || golden == 0 || golden > 255 ||
+	    !PE_parse_boot_arg_str("mp_lvts_r", arg, sizeof(arg)) || arg[0] != 'r') {
+		return "built in";
+	}
+	uint32_t count[NSENS];
+	for (const char *p = arg + 1; n < NSENS && *p;) {
+		uint32_t v = 0;
+		const char *start = p;
+		for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); p++) {
+			v = v * 16 + (uint32_t)(*p <= '9' ? *p - '0' : *p - 'a' + 10);
+		}
+		if (p == start || v == 0 || v > 0xffffff) {
+			return "built in (mp_lvts_r= unreadable)";
+		}
+		count[n++] = v;
+		p += *p == '.';
+	}
+	if (n != NSENS) {
+		return "built in (mp_lvts_r= not nine counts)";
+	}
+	gGolden = golden;
+	memcpy(gCountR, count, sizeof(gCountR));
+	return "mp_lvts_golden=/mp_lvts_r=";
 }
 
 static bool
 lvts_init(void)
 {
+	printf("THERMAL: calibration %s, golden %u\n", lvts_calibration(), gGolden);
 	wr(INFRA_CG_CLR, 1u << 10);
 	wr(INFRA_RST0_SET, rd(INFRA_RST0_SET) | 1);
 	delay(10);
@@ -564,7 +600,7 @@ lvts_init(void)
 		lvts_dev_write(tc, 0x0e, 0x01);                         /* auto RCK */
 		uint64_t b = THERM_BASE + 0x100 * tc;
 		for (int j = 0; j < kTcSensors[tc]; j++) {
-			wr(b + LVTSEDATA00 + 4 * j, kCountR[kTcFirst[tc] + j]);
+			wr(b + LVTSEDATA00 + 4 * j, gCountR[kTcFirst[tc] + j]);
 		}
 		wr(b + LVTSMONCTL0, 0);                                 /* sensing off while configuring */
 		wr(b + LVTSTSSEL, 0x13121110);
@@ -668,6 +704,23 @@ mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *si
 	*signals = gBoostSignals;
 }
 
+/* Readings only, once a second, the hottest every 5 s; nothing is ever applied to a clock. */
+static void
+therm_only_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+	lck_mtx_lock(&mt6781_cpufreq_lock);
+	(void)lvts_read();
+	int t = gTempMax, peak = gTempPeak;
+	lck_mtx_unlock(&mt6781_cpufreq_lock);
+	if (++gThermTicks % 5 == 1) {
+		printf("THERMAL: %s, hottest %d.%d C (peak %d.%d C)\n", gThermWhy, t / 1000, (t % 1000 + 1000) % 1000 / 100,
+		    peak / 1000, (peak % 1000 + 1000) % 1000 / 100);
+	}
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(gThermCall, deadline);
+}
+
 /* Called from MTKPwrap::start (the PMIC is reachable from then on). */
 void
 mt6781_cpufreq_start(void)
@@ -715,8 +768,18 @@ mt6781_cpufreq_start(void)
 		}
 	}
 	if (gMode == 0) {
+		unsigned th = 0;
 		gWhy = "off (mp_cpufreq=0)";
 		printf("CPUFREQ: off (mp_cpufreq=0), clocks left as LK set them\n");
+		if (PE_parse_boot_argn_alias("mp_therm", "vivatherm", &th, sizeof(th)) && th != 0) {
+			gTherm = lvts_init();
+			if (gTherm) {
+				gThermCall = thread_call_allocate_with_options(therm_only_tick, NULL, THREAD_CALL_PRIORITY_KERNEL,
+				    THREAD_CALL_OPTIONS_ONCE);
+				thread_call_enter(gThermCall);
+			}
+			printf("THERMAL: LVTS %s (readings only)\n", gThermWhy);
+		}
 		return;
 	}
 	unsigned th = 1;
