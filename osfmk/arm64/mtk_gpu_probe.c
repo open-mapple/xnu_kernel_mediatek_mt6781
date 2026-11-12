@@ -15,6 +15,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
+#if DEVELOPMENT || DEBUG        /* a bring-up tool: not in a release kernel */
 extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                          /* MTKPwrap.cpp */
 extern void delay(int usec);
 
@@ -271,3 +272,4 @@ mtk_gpu_probe_link(const char *args, char *out, size_t len)
 		snprintf(p, end - p, "gpu: driver not running; gpu probe (boot-arg mp_gpuprobe=1), gpu power (mp_gpuprobe=2)\n");
 	}
 }
+#endif /* DEVELOPMENT || DEBUG */
