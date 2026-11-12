@@ -17,8 +17,10 @@
  *   order  up: Vproc first (wait for the readback), then the PLL; down: the PLL first, then Vproc. posdiv grows
  *          before the PCW write and shrinks after it, as in Linux.
  *
- * The OPP tables are this phone's own (live DTB dvfsp@11bc00 L-table / B-table / CCI-table, which LK fills from the
- * chip's efuse bin): {MHz, vsel, posdiv}. Index 0 is the fastest.
+ * The OPP tables are the phone's own: LK fills dvfsp@11bc00's L-table / B-table / CCI-table from the chip's efuse bin
+ * and mtkloader passes them as mp_dvfs_tbl=; without them (or with a row out of range) DVFS does not start. The built-in
+ * ones are viva's, kept for comparison. {MHz, vsel, posdiv}. Index 0 is the fastest. Vsram is read back against
+ * Vproc + the tracking delta before the first write and after every one; DVFS stops if it does not follow.
  *
  * Governor (every 16 ms, 100 ms when everything idles at the floor): busy = 1 - idle/wall per CPU from recount, the
  * busiest CPU of a cluster counts. >= 80 % busy: the ceiling; else the slowest OPP that would be <= 50 % busy (0183;
@@ -45,9 +47,11 @@
  *   T = -204.65 * raw / 16384 + golden / 2 + 204.65 (degrees). Read every 256 ms by the governor. Policy on the
  *   hottest sensor: >= mp_therm_trip (85 C) one OPP lower for both clusters every sample, below trip - 5 C one OPP
  *   up every second, >= 105 C straight to the floor. Without valid readings the clusters are capped at opp 6
- *   (LL 1618, big 1670). The controller's hardware reset protection (TOPRGU thermal mode) is NOT armed.
+ *   (LL 1618, big 1670). mp_therm_hwreset=C arms the hardware reset at C degrees before any DVFS write (see
+ *   therm_hw_arm); DVFS does not start if that fails.
  *   mp_therm=0 = no LVTS (cap at opp 6).
  * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
+ *   cpu hwtrip C (lower the hardware reset, for the trip test) |
  *   cpu fast on|off | cpu boost on|off | cpu reset (counters).
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
@@ -73,17 +77,17 @@ struct mapple_opp {
 	uint8_t pd;
 };
 
-static const struct mapple_opp kOppLL[NOPP] = {
+static const struct mapple_opp kBuiltinLL[NOPP] = {
 	{ 2000, 85, 1 }, { 1933, 81, 1 }, { 1866, 77, 1 }, { 1800, 72, 1 }, { 1733, 68, 1 }, { 1666, 64, 2 },
 	{ 1618, 60, 2 }, { 1500, 57, 2 }, { 1375, 52, 2 }, { 1275, 48, 2 }, { 1175, 44, 2 }, { 1075, 40, 2 },
 	{ 975, 36, 2 }, { 875, 32, 2 }, { 774, 28, 4 }, { 500, 16, 4 },
 };
-static const struct mapple_opp kOppBig[NOPP] = {
+static const struct mapple_opp kBuiltinBig[NOPP] = {
 	{ 2050, 99, 1 }, { 1986, 95, 1 }, { 1923, 90, 1 }, { 1860, 86, 1 }, { 1796, 82, 1 }, { 1733, 77, 1 },
 	{ 1670, 73, 1 }, { 1530, 66, 2 }, { 1419, 60, 2 }, { 1308, 55, 2 }, { 1169, 48, 2 }, { 1085, 44, 2 },
 	{ 1002, 39, 2 }, { 919, 35, 2 }, { 835, 31, 2 }, { 774, 28, 4 },
 };
-static const struct mapple_opp kOppCCI[NOPP] = {
+static const struct mapple_opp kBuiltinCCI[NOPP] = {
 	{ 1400, 85, 2 }, { 1330, 79, 2 }, { 1260, 72, 2 }, { 1190, 65, 2 }, { 1155, 62, 2 }, { 1120, 58, 2 },
 	{ 1050, 55, 2 }, { 980, 51, 2 }, { 927, 48, 2 }, { 875, 45, 2 }, { 822, 43, 2 }, { 752, 39, 4 },
 	{ 682, 35, 4 }, { 612, 31, 4 }, { 560, 28, 4 }, { 500, 16, 4 },
@@ -91,7 +95,10 @@ static const struct mapple_opp kOppCCI[NOPP] = {
 
 enum { DOM_LL, DOM_BIG, DOM_CCI, NDOM };
 static const char *const kDomName[NDOM] = { "ll", "big", "cci" };
-static const struct mapple_opp *const kOpp[NDOM] = { kOppLL, kOppBig, kOppCCI };
+/* the tables in use: LK's (mp_dvfs_tbl=, dvfs_table()); DVFS does not start without them */
+static struct mapple_opp kOppLL[NOPP], kOppBig[NOPP], kOppCCI[NOPP];
+static struct mapple_opp *const kOpp[NDOM] = { kOppLL, kOppBig, kOppCCI };
+static const struct mapple_opp *const kBuiltin[NDOM] = { kBuiltinLL, kBuiltinBig, kBuiltinCCI };
 static const uint64_t kPllCon1[NDOM] = { 0x1000c204, 0x1000c214, 0x1000c2a4 };
 static const uint64_t kCkDiv[NDOM] = { 0x0c53a2a0, 0x0c53a2a4, 0x0c53a2e0 };
 #define FHCTL_HP_EN     0x1000ce00
@@ -101,6 +108,14 @@ static const uint64_t kCkDiv[NDOM] = { 0x0c53a2a0, 0x0c53a2a4, 0x0c53a2e0 };
 #define VPROC12_DBG0    0x141e
 #define VSRAM11_TRACK0  0x1b64
 #define VSRAM12_TRACK0  0x1b6c
+/* MT6358 layout, as on the MT6366 here: Vsram_proc's own setting (DA_VOSEL, DBG0 bits 14:8), tracking delta
+ * (CON1 6:0), bounds (CON2 6:0, 14:8) */
+#define VSRAM11_DBG0    0x1b60
+#define VSRAM12_DBG0    0x1ba2
+#define VSRAM11_TRACK1  0x1b66
+#define VSRAM12_TRACK1  0x1b6e
+#define VSRAM11_TRACK2  0x1b68
+#define VSRAM12_TRACK2  0x1b70
 #define FLOOR_IDX       14      /* LL 774, big 835, CCI 560: the lowest OPPs are not used */
 #define LL_FIRST        0
 #define LL_LAST         5
@@ -167,6 +182,29 @@ vproc_read(int rail11, uint32_t *vsel)
 	return err;
 }
 
+/* Vsram's setting against Vproc + delta within the tracking bounds, all as the PMIC reports them. */
+static uint32_t gVsram[2], gVsramWant[2], gVsramDelta[2], gVsramLb[2], gVsramHb[2];
+
+static bool
+vsram_tracks(int rail11)
+{
+	uint32_t dbg = 0, t1 = 0, t2 = 0, vproc = 0;
+	int r = rail11 ? 1 : 0;
+	if (mtk_pwrap_read(rail11 ? VSRAM11_DBG0 : VSRAM12_DBG0, &dbg) != 0 ||
+	    mtk_pwrap_read(rail11 ? VSRAM11_TRACK1 : VSRAM12_TRACK1, &t1) != 0 ||
+	    mtk_pwrap_read(rail11 ? VSRAM11_TRACK2 : VSRAM12_TRACK2, &t2) != 0 || vproc_read(rail11, &vproc) != 0) {
+		return false;
+	}
+	gVsram[r] = (dbg >> 8) & 0x7f;
+	gVsramDelta[r] = t1 & 0x7f;
+	gVsramLb[r] = t2 & 0x7f;
+	gVsramHb[r] = (t2 >> 8) & 0x7f;
+	uint32_t want = vproc + gVsramDelta[r];
+	want = want < gVsramLb[r] ? gVsramLb[r] : want > gVsramHb[r] ? gVsramHb[r] : want;
+	gVsramWant[r] = want;
+	return gVsramLb[r] != 0 && gVsramLb[r] < gVsramHb[r] && gVsram[r] == want;
+}
+
 /* Writes Vproc and waits until the buck reports it (DA_VSEL), plus the slew time at ~5 mV/us. */
 static bool
 vproc_set(int rail11, uint32_t vsel)
@@ -186,7 +224,18 @@ vproc_set(int rail11, uint32_t vsel)
 		if (vproc_read(rail11, &now) == 0 && now == vsel) {
 			uint32_t dmv = (vsel > old ? vsel - old : old - vsel) * 625 / 100;
 			delay(10 + dmv / 5);
-			return true;
+			for (int j = 0; j < 100; j++) {
+				if (vsram_tracks(rail11)) {
+					return true;
+				}
+				delay(10);
+			}
+			gReady = false;
+			gWhy = "Vsram did not follow Vproc: DVFS stopped here";
+			printf("CPUFREQ: Vsram%s %u, wanted %u (Vproc %u + %u, %u..%u): DVFS stopped\n", rail11 ? "11" : "12",
+			    gVsram[rail11 ? 1 : 0], gVsramWant[rail11 ? 1 : 0], vsel, gVsramDelta[rail11 ? 1 : 0],
+			    gVsramLb[rail11 ? 1 : 0], gVsramHb[rail11 ? 1 : 0]);
+			return false;
 		}
 		delay(10);
 	}
@@ -446,6 +495,55 @@ gov_stop(void)
 	thread_call_cancel(gCall);
 }
 
+/*
+ * LK's operating points (mtkloader's mp_dvfs_tbl=: L-table, B-table, CCI-table, 16 rows of MHz, vsel, posdiv, clock
+ * divider each, as LK filled them from the chip's efuse bin). NULL if they are in use, else why not.
+ */
+static char gTableNote[96];
+static bool gLkTable;
+
+static const char *
+dvfs_table(void)
+{
+	static char why[80];
+	uint64_t pa = 0;
+	struct mapple_opp t[NDOM][NOPP];
+	if (!PE_parse_boot_argn_alias("mp_dvfs_tbl", "dvfs_tbl", &pa, sizeof(pa)) || pa == 0) {
+		return "no mp_dvfs_tbl (LK's table)";
+	}
+	if (pa < 0x40000000ull || pa + 3 * 64 * 4 > 0xc0000000ull || (pa & 3)) {
+		return "mp_dvfs_tbl outside the memory below XNU";
+	}
+	for (int d = 0; d < NDOM; d++) {
+		for (int i = 0; i < NOPP; i++) {
+			uint64_t w = pa + 4 * (64 * d + 4 * i);
+			uint32_t mhz = rd(w), vsel = rd(w + 4), pd = rd(w + 8), ck = rd(w + 12);
+			if (mhz < 300 || mhz > 2500 || (i > 0 && mhz >= t[d][i - 1].mhz) || vsel < 16 ||
+			    vsel > (d == DOM_BIG ? 99u : 85u) || (pd != 1 && pd != 2 && pd != 4) || ck != 1) {
+				snprintf(why, sizeof(why), "LK's %s row %d not usable: %u MHz vsel %u posdiv %u clkdiv %u", kDomName[d], i,
+				    mhz, vsel, pd, ck);
+				return why;
+			}
+			t[d][i] = (struct mapple_opp){ (uint16_t)mhz, (uint8_t)vsel, (uint8_t)pd };
+		}
+	}
+	int differ = 0;
+	gTableNote[0] = 0;
+	for (int d = 0; d < NDOM; d++) {
+		memcpy(kOpp[d], t[d], sizeof(t[d]));
+		for (int i = 0; i < NOPP; i++) {
+			if (memcmp(&t[d][i], &kBuiltin[d][i], sizeof(t[d][i])) != 0 && differ++ < 3) {
+				size_t n = strlen(gTableNote);
+				snprintf(gTableNote + n, sizeof(gTableNote) - n, " %s %d: %u/%u/%u (viva %u/%u/%u)", kDomName[d], i,
+				    t[d][i].mhz, t[d][i].vsel, t[d][i].pd, kBuiltin[d][i].mhz, kBuiltin[d][i].vsel, kBuiltin[d][i].pd);
+			}
+		}
+	}
+	printf("CPUFREQ: LK's table in use, %d of 48 rows differ from viva's%s\n", differ, gTableNote);
+	gLkTable = true;
+	return NULL;
+}
+
 static bool
 init_checks(void)
 {
@@ -475,6 +573,14 @@ init_checks(void)
 	if (mtk_pwrap_read(VSRAM11_TRACK0, &t11) != 0 || mtk_pwrap_read(VSRAM12_TRACK0, &t12) != 0 ||
 	    (t11 & 6) != 6 || (t12 & 6) != 6) {
 		gWhy = "Vsram tracking off";
+		return false;
+	}
+	bool tr11 = vsram_tracks(1), tr12 = vsram_tracks(0);
+	printf("CPUFREQ: Vsram11 %u (Vproc11 + %u in %u..%u: %u), Vsram12 %u (Vproc12 + %u in %u..%u: %u)%s\n",
+	    gVsram[1], gVsramDelta[1], gVsramLb[1], gVsramHb[1], gVsramWant[1], gVsram[0], gVsramDelta[0], gVsramLb[0],
+	    gVsramHb[0], gVsramWant[0], tr11 && tr12 ? "" : ": not tracking");
+	if (!tr11 || !tr12) {
+		gWhy = "Vsram does not track Vproc";
 		return false;
 	}
 	if (vproc_read(1, &v11) != 0 || vproc_read(0, &v12) != 0 ||
@@ -646,6 +752,88 @@ lvts_read(void)
 	return true;
 }
 
+/*
+ * The hardware over-temperature reset (mp_therm_hwreset=C): each LVTS controller's stage-3 protection at C degrees on its
+ * dominant sensor (index 1, as MediaTek's driver sets it for this SoC: mtk_lvts_tc.c, read for the order only), with
+ * TOPRGU resetting the SoC on the thermal request. TOPRGU is only read: LK leaves the thermal request enabled in
+ * reset mode (REQ_MODE bit 18 set, REQ_IRQ_EN bit 18 clear; 0x3f0032 / 0x3b0030 in pl_lk). Armed before any DVFS
+ * write; DVFS does not start without it when asked for.
+ */
+#define TOPRGU_REQ_MODE         0x10007030ull
+#define TOPRGU_REQ_IRQ_EN       0x10007034ull
+#define RGU_REQ_THERMAL         (1u << 18)
+#define LVTSMONINT              0x00c
+#define LVTSPROTCTL             0x0c0
+#define LVTSPROTTC              0x0cc
+#define PROT_DOMINANT_1         (6u << 16)      /* (index << 2 | 2) << 16 */
+
+static uint32_t gHwTrip;                /* degrees, 0 = not armed */
+static uint32_t gRguMode, gRguIrq;
+static const char *gHwWhy = "off (no mp_therm_hwreset)";
+
+static uint32_t
+lvts_mc_to_raw(int mc)
+{
+	return (uint32_t)(((int64_t)204650 + (int64_t)gGolden * 500 - mc) * 16384 / 204650);
+}
+
+static bool
+therm_hw_threshold(uint32_t c)
+{
+	uint32_t raw = lvts_mc_to_raw((int)c * 1000);
+	for (int tc = 0; tc < NTC; tc++) {
+		wr(THERM_BASE + 0x100 * tc + LVTSPROTTC, raw);
+		if (rd(THERM_BASE + 0x100 * tc + LVTSPROTTC) != raw) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+therm_hw_arm(uint32_t c)
+{
+	gRguMode = rd(TOPRGU_REQ_MODE);
+	gRguIrq = rd(TOPRGU_REQ_IRQ_EN);
+	if (!(gRguMode & RGU_REQ_THERMAL) || (gRguIrq & RGU_REQ_THERMAL)) {
+		gHwWhy = "TOPRGU does not reset on the thermal request";
+		return false;
+	}
+	bool valid = false;
+	for (int i = 0; i < 200 && !(valid = lvts_read()); i++) {
+		delay(10000);
+	}
+	if (!valid) {
+		gHwWhy = "no valid LVTS readings";
+		return false;
+	}
+	if (c < 60 || c > 117 || gTempMax / 1000 + 10 > (int)c) {
+		gHwWhy = "trip temperature out of range (60..117 C, 10 C above the hottest sensor)";
+		return false;
+	}
+	for (int tc = 0; tc < NTC; tc++) {
+		uint64_t b = THERM_BASE + 0x100 * tc;
+		wr(b + LVTSMONINT, 0);
+		wr(b + LVTSPROTCTL, (rd(b + LVTSPROTCTL) & ~(0xfu << 16)) | PROT_DOMINANT_1);
+	}
+	if (!therm_hw_threshold(c)) {
+		gHwWhy = "threshold did not read back";
+		return false;
+	}
+	for (int tc = 0; tc < NTC; tc++) {
+		uint64_t b = THERM_BASE + 0x100 * tc;
+		wr(b + LVTSMONINT, 1u << 31);
+		wr(b + LVTSPROTCTL, rd(b + LVTSPROTCTL) & ~0xffffu);
+		if (!(rd(b + LVTSMONINT) & (1u << 31)) || (rd(b + LVTSPROTCTL) & 0xfffff) != PROT_DOMINANT_1) {
+			gHwWhy = "protection did not read back";
+			return false;
+		}
+	}
+	gHwTrip = c;
+	gHwWhy = "armed";
+	return true;
+}
+
 /* Every 16 governor samples (~256 ms). Caller holds the lock. */
 static void
 therm_tick(void)
@@ -732,6 +920,10 @@ mt6781_cpufreq_start(void)
 	if (PE_parse_boot_argn_alias("mp_cpufreq_fast", "vivacpufast", &v, sizeof(v))) {
 		gFast = v != 0;
 	}
+	for (int d = 0; d < NDOM; d++) {
+		memcpy(kOpp[d], kBuiltin[d], sizeof(kBuiltinLL));
+	}
+	const char *noTable = gMode != 0 ? dvfs_table() : NULL;
 	unsigned def[NDOM] = { 2000, 2050, 1400 }, lpm[NDOM] = { 1500, 1530, 1050 };
 	const char *const arg[NDOM] = { "mp_cpufreq_ll", "mp_cpufreq_big", "mp_cpufreq_cci" };
 	const char *const old[NDOM] = { "vivacpull", "vivacpubig", "vivacpucci" };
@@ -791,9 +983,30 @@ mt6781_cpufreq_start(void)
 		gThermWhy = "off (mp_therm=0)";
 	}
 	gThermIdx = THERM_NOVALID_CAP;          /* until the first valid reading */
+	unsigned hw = 0;
+	bool armed = false;
+	if (PE_parse_boot_argn_alias("mp_therm_hwreset", "vivathermhw", &hw, sizeof(hw)) && hw != 0) {
+		armed = gTherm && therm_hw_arm(hw);
+		if (!gTherm) {
+			gHwWhy = "no LVTS";
+		}
+		printf("THERMAL: hardware reset at %u C: %s (TOPRGU REQ_MODE 0x%x REQ_IRQ_EN 0x%x, raw %u)\n", hw, gHwWhy,
+		    gRguMode, gRguIrq, lvts_mc_to_raw((int)hw * 1000));
+	}
+	if (gTherm) {           /* readings in the log every 5 s, whatever the governor does */
+		gThermCall = thread_call_allocate_with_options(therm_only_tick, NULL, THREAD_CALL_PRIORITY_KERNEL,
+		    THREAD_CALL_OPTIONS_ONCE);
+		thread_call_enter(gThermCall);
+	}
 	gCall = thread_call_allocate_with_options(gov_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
 	lck_mtx_lock(&mt6781_cpufreq_lock);
-	gReady = init_checks();
+	if (noTable != NULL) {
+		gWhy = noTable;
+	} else if (hw != 0 && !armed) {
+		gWhy = "the hardware over-temperature reset is not armed";
+	} else {
+		gReady = init_checks();
+	}
 	if (gReady) {
 		gWhy = "ok";
 		account_time();
@@ -867,7 +1080,26 @@ mt6781_cpufreq_link(const char *args, char *out, size_t len)
 	const char *a = skip(args ? args : "");
 	out[0] = 0;
 	lck_mtx_lock(&mt6781_cpufreq_lock);
-	if (strncmp(a, "gov", 3) == 0) {
+	if (strncmp(a, "hwtrip", 6) == 0) {
+		/* the trip test: the hardware reset lowered to C degrees (never raised), at least 3 C above the hottest sensor */
+		const char *b = skip(word_end(a));
+		unsigned c = 0;
+		while (*b >= '0' && *b <= '9') {
+			c = c * 10 + (unsigned)(*b++ - '0');
+		}
+		if (gHwTrip == 0) {
+			SAY("hardware reset not armed: %s\n", gHwWhy);
+		} else if (c < 50 || c > gHwTrip || (int)c < gTempMax / 1000 + 3) {
+			SAY("usage: cpu hwtrip C (50..%u, at least 3 C above the hottest sensor, now %d C)\n", gHwTrip,
+			    gTempMax / 1000);
+		} else if (!therm_hw_threshold(c)) {
+			SAY("threshold did not read back\n");
+		} else {
+			gHwTrip = c;
+			SAY("hardware reset now at %u C (raw %u); hottest %d.%d C\n", c, lvts_mc_to_raw((int)c * 1000),
+			    gTempMax / 1000, (gTempMax % 1000 + 1000) % 1000 / 100);
+		}
+	} else if (strncmp(a, "gov", 3) == 0) {
 		const char *b = skip(word_end(a));
 		if (strncmp(b, "on", 2) == 0) {
 			gov_start();
@@ -940,6 +1172,9 @@ mt6781_cpufreq_link(const char *args, char *out, size_t len)
 		SAY("cpufreq: %s, governor %s, mode %d, low power %s, thermal cap opp %d, A76 preference %s (0x%llx)\n",
 		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gThermIdx, gFast ? "on" : "off",
 		    sched_mapple_fast_cpus);
+		SAY("  table: %s;%s\n  hardware reset: %s, %u C (TOPRGU REQ_MODE 0x%x REQ_IRQ_EN 0x%x)\n"
+		    "  Vsram11 %u want %u (+%u, %u..%u), Vsram12 %u want %u (+%u, %u..%u)\n", gLkTable ? "LK's" : "none (viva's built-in shown)", gTableNote, gHwWhy, gHwTrip, gRguMode, gRguIrq, gVsram[1], gVsramWant[1],
+		    gVsramDelta[1], gVsramLb[1], gVsramHb[1], gVsram[0], gVsramWant[0], gVsramDelta[0], gVsramLb[0], gVsramHb[0]);
 		SAY("  thermal: %s, trip %d C, hottest %d.%d C (peak %d.%d C), cap opp %d, %llu steps down, %llu up\n  ",
 		    gThermWhy, gTrip, gTempMax / 1000, (gTempMax % 1000 + 1000) % 1000 / 100, gTempPeak / 1000,
 		    (gTempPeak % 1000 + 1000) % 1000 / 100, gThermIdx, gThermStepsDown, gThermStepsUp);
