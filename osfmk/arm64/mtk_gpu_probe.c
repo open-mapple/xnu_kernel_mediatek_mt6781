@@ -1,8 +1,9 @@
 /*
  * The realme 8i's Mali-G57 MC2 before any driver: what LK leaves (boot-arg mp_gpuprobe=1, link `gpu probe`) and the GPU
  * powered as LK left its supply (mp_gpuprobe=2, link `gpu power`): MFG0-3 on, mfgcfg set up, GPU_ID and SHADER_PRESENT
- * read. Never a PMIC write: VGPU and VSRAM_GPU stay at LK's levels, MFGPLL at LK's 300 MHz. Anything not as expected
- * refuses before the first write. Nothing is powered off again: a reboot does that.
+ * read, then its interrupts masked and the domains powered down again (MFGPLL and the rails stay as LK left them).
+ * Never a PMIC write: VGPU and VSRAM_GPU stay at LK's levels, MFGPLL at LK's 300 MHz. Anything not as expected
+ * refuses before the first write.
  *
  * Registers and order from MediaTek's mt6781 clock/power-domain sources and the realme 8i device tree (read for
  * addresses and order only) and from ios-viva's VivaGPU.cpp.
@@ -39,8 +40,10 @@ extern void delay(int usec);
 #define MFGPLL_300MHZ   0x031713b1u
 
 #define INFRA           0x10001000ull
+#define PROT_SET        0x2a0
 #define PROT_CLR        0x2a4
 #define PROT_STA1       0x228
+#define PROT1_SET       0x2a8
 #define PROT1_CLR       0x2ac
 #define PROT1_STA1      0x258
 #define ACP_CON         0x290
@@ -48,6 +51,15 @@ extern void delay(int usec);
 #define MFGCFG          0x13fbf000ull
 #define MALI            0x13000000ull
 #define GPU_ID          0x000
+#define GPU_IRQ_RAWSTAT 0x020
+#define GPU_IRQ_CLEAR   0x024
+#define GPU_IRQ_MASK    0x028
+#define JOB_IRQ_RAWSTAT 0x1000
+#define JOB_IRQ_CLEAR   0x1004
+#define JOB_IRQ_MASK    0x1008
+#define MMU_IRQ_RAWSTAT 0x2000
+#define MMU_IRQ_CLEAR   0x2004
+#define MMU_IRQ_MASK    0x2008
 #define SHADER_PRESENT  0x100
 #define GPU_ID_G57_MC2  0x90930010u             /* Android's kbase: "arch 9.0.9 r0p1" */
 #define SHADERS_SPACED  0x5u                    /* cores 0 and 2 (Android: shader_present=5) */
@@ -124,6 +136,52 @@ gpu_probe(char **p, char *end, bool *mfgOn)
 	return rails && pll && (on == 0 || *mfgOn) && on == on2;
 }
 
+/* MFG1's bus protection steps, set in this order before it powers off (released in reverse when it powers on) */
+static const struct { uint32_t set, sta, mask; } gProt[4] = {
+	{ PROT1_SET, PROT1_STA1, 0x18000000 }, { PROT_SET, PROT_STA1, 0x00600000 },
+	{ PROT_SET, PROT_STA1, 0x02000000 }, { PROT1_SET, PROT1_STA1, 0x20000000 },
+};
+
+/* The domains off again, MFG3 to MFG0, as MappleGPU's mfgOff without its PLL and rail steps. false: something was left on. */
+static bool
+gpu_down(char **p, char *end)
+{
+	wr(SPM + SPM_KEY_REG, SPM_KEY);
+	wr(MFGCFG + 0x0b4, 1);                                          /* QCHANNEL_CON */
+	wr(MFGCFG + 0x170, 3);                                          /* BUS_IDLE_CON */
+	if (!poll_ms(MFGCFG + 0x178, 1u << 2, 1u << 2)) {
+		SAY("  GPU bus not idle (0x%08x)\n", rd(MFGCFG + 0x178));
+	}
+	wr(MFGCFG + 0x004, 1u << 0);                                    /* CG_SET: BG3D clock off */
+	for (int n = 3; n >= 0; n--) {
+		uint64_t con = SPM + MFG_PWR_CON(n);
+		if (n == 1) {
+			for (int i = 0; i < 4; i++) {
+				wr(INFRA + gProt[i].set, gProt[i].mask);
+				if (!poll_ms(INFRA + gProt[i].sta, gProt[i].mask, gProt[i].mask)) {
+					SAY("  MFG1: bus protection step %d not acknowledged (0x%08x): MFG0-1 left on\n", i + 1,
+					    rd(INFRA + gProt[i].sta));
+					return false;
+				}
+			}
+		}
+		wr(con, rd(con) | PWR_SRAM_PDN);
+		if (!poll_ms(con, PWR_SRAM_ACK, PWR_SRAM_ACK)) {
+			SAY("  MFG%d: no SRAM power-down ack\n", n);
+		}
+		wr(con, rd(con) | PWR_ISO);
+		wr(con, rd(con) | PWR_CLK_DIS);
+		wr(con, rd(con) & ~PWR_RST_B);
+		wr(con, rd(con) & ~PWR_ON);
+		wr(con, rd(con) & ~PWR_ON_2ND);
+		if (!poll_ms(SPM + PWR_STATUS, MFG_BIT(n), 0) || !poll_ms(SPM + PWR_STATUS_2ND, MFG_BIT(n), 0)) {
+			SAY("  MFG%d: still on after power off\n", n);
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Step 2: the four domains on (as MediaTek's power-domain driver and MappleGPU's mtcmosOn), then mfgcfg as gpufreq sets
  * it up, then the Mali's identity. */
 static void
@@ -173,7 +231,21 @@ gpu_power(char **p, char *end)
 	uint32_t id = rd(MALI + GPU_ID), sh = rd(MALI + SHADER_PRESENT), cg = rd(MFGCFG + 0x000);
 	bool ok = id == GPU_ID_G57_MC2 && sh == SHADERS_SPACED && !(cg & 1);
 	SAY("gpu power: mfgcfg cg 0x%08x; GPU_ID 0x%08x (want 0x%08x), SHADER_PRESENT 0x%x (want 0x%x): %s\n",
-	    cg, id, GPU_ID_G57_MC2, sh, SHADERS_SPACED, ok ? "the Mali-G57 MC2 as expected" : "MISMATCH: stop here");
+	    cg, id, GPU_ID_G57_MC2, sh, SHADERS_SPACED, ok ? "the Mali-G57 MC2 as expected" : "MISMATCH");
+	/* nothing services the Mali's interrupts here: all masked and cleared before the domains go off */
+	SAY("  irq raw/mask before: gpu 0x%08x/0x%08x job 0x%08x/0x%08x mmu 0x%08x/0x%08x\n", rd(MALI + GPU_IRQ_RAWSTAT),
+	    rd(MALI + GPU_IRQ_MASK), rd(MALI + JOB_IRQ_RAWSTAT), rd(MALI + JOB_IRQ_MASK), rd(MALI + MMU_IRQ_RAWSTAT),
+	    rd(MALI + MMU_IRQ_MASK));
+	wr(MALI + GPU_IRQ_MASK, 0);
+	wr(MALI + JOB_IRQ_MASK, 0);
+	wr(MALI + MMU_IRQ_MASK, 0);
+	wr(MALI + GPU_IRQ_CLEAR, 0xffffffff);
+	wr(MALI + JOB_IRQ_CLEAR, 0xffffffff);
+	wr(MALI + MMU_IRQ_CLEAR, 0xffffffff);
+	bool down = gpu_down(p, end);
+	SAY("gpu power: %s; MFG0-3 status 0x%x / 0x%x, MFGPLL con0 0x%08x (rails untouched)\n",
+	    down ? "powered down again" : "NOT all powered down (reboot to undo)", (rd(SPM + PWR_STATUS) >> 2) & 0xf,
+	    (rd(SPM + PWR_STATUS_2ND) >> 2) & 0xf, rd(MFGPLL_CON0));
 }
 
 void mtk_gpu_probe_link(const char *args, char *out, size_t len);
