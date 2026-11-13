@@ -100,15 +100,15 @@ capabilities(void)
 bool
 AppleM2ScalerCSCDriver::start(IOService *provider)
 {
-	int mode = 0;
+	int mode = 2;
 	PE_parse_boot_argn_alias("mp_scaler", "vivascaler", &mode, sizeof(mode));
 	if (mode <= 0) {
-		IOLog("SCALER: off (boot-arg mp_scaler=1 CPU, 2 MDP)\n");
+		IOLog("SCALER: off (mp_scaler=0; 1 CPU, 2 MDP, the default)\n");
 		return false;
 	}
 	fFormats = 3;
 	PE_parse_boot_argn_alias("mp_scaler_formats", "vivascalerformats", &fFormats, sizeof(fFormats));
-	fCpuMax = 65536;
+	fCpuMax = UINT32_MAX;
 	PE_parse_boot_argn_alias("mp_scaler_cpumax", "vivascalercpumax", &fCpuMax, sizeof(fCpuMax));
 	fLock = IOLockAlloc();
 	if (fLock == NULL || !IOService::start(provider)) {

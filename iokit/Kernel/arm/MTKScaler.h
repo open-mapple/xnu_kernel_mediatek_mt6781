@@ -4,19 +4,19 @@
  * gpu/docs/ABI-IOSURFACEACCELERATOR.md in the viva-gpu repository.
  *
  * Boot-arg mp_scaler (the Viva Manager app sets it, MaliMetal > Acceleratori):
- *   0 (default)  the service is not published: every client falls back as before (QuartzCore to the GPU,
- *                VideoToolbox to software conversions)
+ *   0            the service is not published: QuartzCore falls back to the GPU, but VideoToolbox's transfers between
+ *                IOSurfaces give zeros (Photos, and anything scaling through VideoToolbox)
  *   1            published, transfers done by the CPU in the kernel (backend "cpu")
- *   2            published, transfers on the MDP engines (RDMA -> RSZ -> WROT) when the format and size allow it,
+ *   2 (default)  published, transfers on the MDP engines (RDMA -> RSZ -> WROT) when the format and size allow it,
  *                the CPU otherwise (backend "mdp"; needs the MDP power domain: falls back to 1 if it is off)
  * mp_scaler_formats (bitmask, default 3): 1 = 32-bit RGB (BGRA/RGBA/ARGB), 2 = 4:2:0 biplanar (420v/420f) as
  *   source. Formats outside the mask are refused with kIOReturnUnsupported, which every client handles by
  *   falling back (VideoToolbox propagates errors of a published service, hence the mask).
  *
- * mp_scaler_cpumax (pixels, default 65536): largest destination the CPU scales or converts. Bigger requests that the MDP
- *   cannot take are refused with kIOReturnUnsupported: QuartzCore then does them on the GPU as without the service
- *   (its switcher/snapshot reductions of the whole screen, 1125x2436 -> 787x1705, cost tens of milliseconds on the
- *   CPU against ~2 ms on the GPU). Same-size copies of one RGB format are always done (one memcpy per row).
+ * mp_scaler_cpumax (pixels, default no limit): largest destination the CPU scales or converts; bigger requests are refused
+ *   with kIOReturnUnsupported. QuartzCore then uses the GPU (its whole-screen reductions, 1125x2436 -> 787x1705, cost
+ *   tens of milliseconds on the CPU against ~2 ms on the GPU), but VideoToolbox gives zeros: with the MDP backend the
+ *   CPU only gets what the MDP cannot take, so it takes everything. Same-size copies of one RGB format are always done.
  *
  * Counters: property "MTKScalerStats" of the service (ioreg / Viva Manager).
  */
