@@ -1,5 +1,6 @@
 /*
- * osfmk/arm64/mt6781_cam.h: the camtg rates, the muxes' fields and when a camera block may be read.
+ * osfmk/arm64/mt6781_cam.h: the camtg rates, the muxes' fields, when a camera block may be read, and the main
+ * camera's pin registers.
  *   cc -Wall tools/mt6781_cam_test.c -o mt6781_cam_test && ./mt6781_cam_test
  */
 #include <assert.h>
@@ -50,6 +51,35 @@ main(void)
 	assert(mt6781_cam_skip(&a, CAM_CG_SENINF, MT6781_CAM_CAMSV) == NULL);
 	a.pwr &= ~CAM_PWR_CSI;
 	assert(mt6781_cam_skip(&a, 0, MT6781_CAM_CAMSV) == NULL && mt6781_cam_skip(&a, 0, MT6781_CAM_SENINF) != NULL);
+	/* camtg0-6: run 38's CLK_CFG_0-2, all 24 MHz; one at 26 MHz or powered down is not */
+	{
+		uint32_t cfg[3] = { 0x1010001, 0x1010101, 0x3000101 }, c, shift;
+
+		assert(mt6781_camtg_24(cfg));
+		mt6781_camtg_field(0, &c, &shift);
+		assert(c == 0 && shift == 24);
+		mt6781_camtg_field(4, &c, &shift);
+		assert(c == 1 && shift == 24);
+		mt6781_camtg_field(6, &c, &shift);
+		assert(c == 2 && shift == 8);
+		cfg[2] = 0x3000001;
+		assert(!mt6781_camtg_24(cfg));
+		cfg[2] = 0x3008101;
+		assert(!mt6781_camtg_24(cfg));
+		cfg[2] = 0x3000101;
+		cfg[0] = 0x81010001;
+		assert(!mt6781_camtg_24(cfg));
+	}
+
+	/* pinctrl-mt6781.c: GPIO20's mode at 0x320 [19:16], DO 0x100 / DIR 0x000 bit 20; GPIO141's mode 0x410 [23:20] */
+	assert(CAM_GPIO_MODE(CAM_PIN_RST) == 0x320 && mt6781_cam_mwr(CAM_PIN_RST, 0) == 0x80000);
+	assert(CAM_GPIO_DOUT(CAM_PIN_RST) == 0x100 && CAM_GPIO_DIR(CAM_PIN_RST) == 0x000 && CAM_PIN_RST % 32 == 20);
+	assert(CAM_GPIO_MODE(CAM_PIN_MCLK) == 0x410 && mt6781_cam_mwr(CAM_PIN_MCLK, 1) == 0x900000);
+	assert(mt6781_cam_mwr(CAM_PIN_MCLK, 0) == 0x800000 && CAM_GPIO_DIN(CAM_PIN_MCLK) == 0x240);
+	assert(mt6781_cam_pin_mode(0x00100000, CAM_PIN_MCLK) == 1 && mt6781_cam_pin_mode(0x0f0fffff, CAM_PIN_MCLK) == 0);
+	/* drive-strength 2 and 1 in [5:3]: 6 mA and 4 mA */
+	assert((CAM_MCLK_DRV_ON << CAM_MCLK_DRV_SHIFT) == 0x10 && ((~CAM_MCLK_DRV_ON & 7) << CAM_MCLK_DRV_SHIFT) == 0x28);
+	assert((CAM_MCLK_DRV_OFF << CAM_MCLK_DRV_SHIFT) == 0x08 && ((~CAM_MCLK_DRV_OFF & 7) << CAM_MCLK_DRV_SHIFT) == 0x30);
 	printf("mt6781_cam: ok\n");
 	return 0;
 }
