@@ -30,10 +30,9 @@ bool mt6781_scp_recv(uint32_t *id, void *data, uint32_t *len, uint32_t max);
 #define SCP_CFG         0x105c0000u
 
 #define CLK_CFG_UPDATE  (TOPCKGEN + 0x004)      /* bit 1: scp_sel's new setting taken */
-#define CLK_CFG_0       (TOPCKGEN + 0x040)      /* [10:8] scp_sel (0 = clk26m), bit 15 its gate */
+#define CLK_CFG_0       (TOPCKGEN + 0x040)      /* [10:8] scp_sel (0 = clk26m); bit 15 its power-down, never written */
 #define CLK_CFG_0_CLR   (TOPCKGEN + 0x048)
 #define SCP_SEL         (7u << 8)
-#define SCP_SEL_GATE    (1u << 15)
 #define INFRA_IRQ_SET   (INFRACFG_AO + 0xb14)   /* awake handshake: 0xA0 | bit 0 lock, bit 1 unlock */
 #define INFRA_IRQ_CLR   (INFRACFG_AO + 0xb18)
 #define SCP_RUN         (SCP_CFG + 0x000)
@@ -48,7 +47,7 @@ bool mt6781_scp_recv(uint32_t *id, void *data, uint32_t *len, uint32_t max);
 static const struct {
 	uint32_t pa, value;
 } scp_regs[] = {
-	{ CLK_CFG_0_CLR, SCP_SEL | SCP_SEL_GATE }, { CLK_CFG_UPDATE, 1u << 1 },
+	{ CLK_CFG_0_CLR, SCP_SEL }, { CLK_CFG_UPDATE, 1u << 1 },
 	{ INFRA_IRQ_SET, 0xa1 }, { INFRA_IRQ_SET, 0xa2 },
 	{ SCP_RUN, 1 }, { SCP_TO_HOST, 1 }, { SCP_TO_SPM, 1 }, { SCP_GIPC_IN, 1 }, { SCP_GIPC_IN, 4 },
 };
@@ -117,25 +116,25 @@ mt6781_scp_sram(uint32_t off)
 	return off < SCP_SRAM_SIZE && (off & 3) == 0 ? *(volatile uint32_t *)(sram + off) : 0;
 }
 
-/* CLK_CFG_0: scp_sel's parent in [10:8], its gate at bit 15 */
+/* CLK_CFG_0: scp_sel's parent in [10:8], its power-down at bit 15 */
 uint32_t
 mt6781_scp_clock(void)
 {
 	return rd(CLK_CFG_0);
 }
 
-/* scp_sel on clk26m and ungated, as Android's kernel has it before the start (TOP_MUX_SCP, scp_pll_ctrl_set) */
+/* scp_sel on clk26m, as Android's kernel sets it before the start (clk-mux.c set_parent: CLR the field, UPDATE bit 1) */
 bool
 mt6781_scp_clock_26m(void)
 {
-	if ((rd(CLK_CFG_0) & (SCP_SEL | SCP_SEL_GATE)) == 0) {
+	if ((rd(CLK_CFG_0) & SCP_SEL) == 0) {
 		return true;
 	}
-	if (!scp_write(CLK_CFG_0_CLR, SCP_SEL | SCP_SEL_GATE) || !scp_write(CLK_CFG_UPDATE, 1u << 1)) {
+	if (!scp_write(CLK_CFG_0_CLR, SCP_SEL) || !scp_write(CLK_CFG_UPDATE, 1u << 1)) {
 		return false;
 	}
 	delay(100);
-	return (rd(CLK_CFG_0) & (SCP_SEL | SCP_SEL_GATE)) == 0;
+	return (rd(CLK_CFG_0) & SCP_SEL) == 0;
 }
 
 /* Let it run, once: only from held (cfg+0 reads 0). */
